@@ -1,0 +1,6 @@
+/target
+/assets/audio_conversion/
+/.idea/
+
+/Cargo.lock
+/resource.rc
