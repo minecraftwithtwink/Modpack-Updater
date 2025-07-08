@@ -8,8 +8,6 @@ use std::sync::mpsc::Sender;
 const GIT_REMOTE_URL: &str = "https://github.com/minecraftwithtwink/Twinkcraft-Modpack.git";
 const GIT_BRANCH_NAME: &str = "main";
 
-/// Performs a special checkout on a list of directories to remove any local files
-/// that are not present in the remote repository's version of those directories.
 fn clean_managed_directories(repo: &Repository, progress_tx: &Sender<GitProgress>) -> Result<()> {
     const DIRS_TO_CLEAN: &[&str] = &[
         "mods",
@@ -30,25 +28,16 @@ fn clean_managed_directories(repo: &Repository, progress_tx: &Sender<GitProgress
     Ok(())
 }
 
-/// Copy default configuration files from the 'configureddefaults' folder to their
-/// final destinations, overwriting any existing files and creating new ones if they don't exist.
+// --- REWRITTEN: This function now uses only the Rust standard library for maximum compatibility ---
 fn force_copy_default_configs(instance_path: &Path, progress_tx: &Sender<GitProgress>) -> Result<()> {
     progress_tx.send(GitProgress::Update("Applying default configurations...".to_string(), 1.0)).ok();
 
     let source_base = instance_path.join("configureddefaults");
-    let dest_base = instance_path;
-    let copy_options = fs_extra::dir::CopyOptions {
-        overwrite: true,
-        ..Default::default()
-    };
 
-    // Format: (source path relative to 'configureddefaults', destination relative to instance root, is_directory)
     const ITEMS_TO_COPY: &[(&str, &str, bool)] = &[
-        // Folders
         ("config/fancymenu", "config/fancymenu", true),
         ("customsplashscreen", "customsplashscreen", true),
         ("config/fog", "config/fog", true),
-        // Files
         ("config/customsplashscreen.json", "config/customsplashscreen.json", false),
         ("config/raised.json", "config/raised.json", false),
         ("sodium-extra.properties", "sodium-extra.properties", false),
@@ -65,22 +54,41 @@ fn force_copy_default_configs(instance_path: &Path, progress_tx: &Sender<GitProg
 
     for (source_suffix, dest_suffix, is_directory) in ITEMS_TO_COPY {
         let source_path = source_base.join(source_suffix);
-        let dest_path = dest_base.join(dest_suffix);
+        let dest_path = instance_path.join(dest_suffix);
 
         if source_path.exists() {
-            // This ensures the parent directory (e.g., 'config/') exists before copying into it.
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)?;
             }
 
             if *is_directory {
-                fs_extra::dir::copy(&source_path, &dest_path, &copy_options)?;
+                // Remove the old directory first to ensure a clean copy
+                if dest_path.exists() {
+                    fs::remove_dir_all(&dest_path)?;
+                }
+                // Now, perform a recursive copy
+                copy_dir_all(&source_path, &dest_path)?;
             } else {
-                fs_extra::file::copy(&source_path, &dest_path, &fs_extra::file::CopyOptions { overwrite: true, ..Default::default() })?;
+                fs::copy(&source_path, &dest_path)?;
             }
         }
     }
 
+    Ok(())
+}
+
+// --- ADDED: A helper function for recursive directory copy using std::fs ---
+fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
+    fs::create_dir_all(&dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
     Ok(())
 }
 
@@ -135,8 +143,11 @@ pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitPro
         let fetch_head: AnnotatedCommit = repo.find_annotated_commit(fetch_commit.id())?;
         let (analysis, _) = repo.merge_analysis(&[&fetch_head])?;
 
+        // --- MODIFIED: Restructured logic to always run the final steps ---
         if analysis.is_up_to_date() {
-            Ok(format!("Repository is already up-to-date at:\n\n{}\n\nPress Enter to close.", path.display()))
+            // It's up-to-date, but we still force the cleanup and config copy.
+            progress_tx.send(GitProgress::Update("Repository up-to-date. Verifying files...".to_string(), 1.0)).ok();
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         } else if analysis.is_fast_forward() || repo.head().is_err() {
             progress_tx.send(GitProgress::Update("Applying fast-forward update...".to_string(), 1.0)).ok();
             let local_branch_ref_name = format!("refs/heads/{}", GIT_BRANCH_NAME);
@@ -146,12 +157,7 @@ pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitPro
             };
             local_branch_ref.set_target(fetch_commit.id(), "Fast-forward")?;
             repo.set_head(&local_branch_ref_name)?;
-            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
-
-            clean_managed_directories(&repo, &progress_tx)?;
-            force_copy_default_configs(&path, &progress_tx)?;
-
-            Ok(format!("Successfully updated repository at:\n\n{}\n\nPress Enter to close.", path.display()))
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         } else {
             progress_tx.send(GitProgress::Update("Merging changes...".to_string(), 1.0)).ok();
             let our_commit = repo.head()?.peel_to_commit()?;
@@ -165,13 +171,14 @@ pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitPro
             let result_tree = repo.find_tree(result_tree_id)?;
             let signature = git2::Signature::now("Modpack Updater", "updater@example.com")?;
             repo.commit(Some("HEAD"), &signature, &signature, &format!("Merge remote-tracking branch 'origin/{}'", GIT_BRANCH_NAME), &result_tree, &[&our_commit, &fetch_commit])?;
-            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
-
-            clean_managed_directories(&repo, &progress_tx)?;
-            force_copy_default_configs(&path, &progress_tx)?;
-
-            Ok(format!("Successfully merged and updated repository at:\n\n{}\n\nPress Enter to close.", path.display()))
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         }
+
+        // These crucial steps now run on EVERY successful path.
+        clean_managed_directories(&repo, &progress_tx)?;
+        force_copy_default_configs(&path, &progress_tx)?;
+
+        Ok(format!("Successfully updated and verified repository at:\n\n{}\n\nPress Enter to close.", path.display()))
     })();
 
     match result {
