@@ -17,25 +17,31 @@ fn get_history_path() -> Result<PathBuf> {
     Ok(get_config_dir()?.join("history.txt"))
 }
 
+// --- ADDED: A function to get the path for our new tutorial flag file ---
 fn get_tutorial_flag_path() -> Result<PathBuf> {
     Ok(get_config_dir()?.join("tutorial.flag"))
 }
 
+// --- ADDED: A function to create the flag file, marking the tutorial as done ---
 pub fn mark_tutorial_as_completed() -> Result<()> {
     let path = get_tutorial_flag_path()?;
+    // Create an empty file. Its existence is all that matters.
     fs::write(path, "")?;
     Ok(())
 }
 
+// --- ADDED: The main logic to decide if the tutorial should run ---
+/// Checks if the tutorial should be started.
+/// It runs only if the instance history is empty AND the completion flag doesn't exist.
 pub fn should_start_tutorial() -> bool {
     let history_is_empty = match load() {
         Ok(h) => h.is_empty(),
-        Err(_) => true,
+        Err(_) => true, // If loading fails, assume empty
     };
 
     let flag_exists = match get_tutorial_flag_path() {
         Ok(path) => path.exists(),
-        Err(_) => false,
+        Err(_) => false, // If we can't get path, assume no flag
     };
 
     history_is_empty && !flag_exists

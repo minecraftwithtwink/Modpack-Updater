@@ -1,4 +1,5 @@
-use crate::app::{history, App, AppState, RunMode, TutorialState};
+use crate::app::{history, App, AppState, RunMode, TutorialState, UpdateStatus};
+use crate::changelog;
 use crate::git;
 use crate::music::MusicPlayer;
 use crate::ui;
@@ -6,6 +7,7 @@ use anyhow::Result;
 use arboard::Clipboard;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::backend::Backend;
+use ratatui::widgets::ListState;
 use ratatui::Terminal;
 use std::env;
 use std::io::Write;
@@ -21,6 +23,54 @@ pub fn run<B: Backend + Write>(
     music_player: &mut MusicPlayer,
 ) -> Result<()> {
     loop {
+        if let Some(rx) = &app.update_rx {
+            if let Ok(status) = rx.try_recv() {
+                match status {
+                    UpdateStatus::UpdateAvailable(version) => {
+                        if app.tutorial.is_some() {
+                            app.pending_update = Some(version);
+                        } else {
+                            app.state = AppState::ConfirmUpdate { version };
+                        }
+                    }
+                    _ => {}
+                }
+                app.update_rx = None;
+            }
+        }
+
+        if let Some(rx) = &app.changelog_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(content) => {
+                        app.state = AppState::ViewingChangelog { content, scroll: 0 };
+                    }
+                    Err(e) => {
+                        app.state = AppState::Finished(format!("Failed to fetch changelog:\n\n{}", e));
+                    }
+                }
+                app.changelog_rx = None;
+            }
+        }
+
+        if let Some(rx) = &app.branch_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(branches) => {
+                        let mut list_state = ListState::default();
+                        if !branches.is_empty() {
+                            list_state.select(Some(0));
+                        }
+                        app.state = AppState::BranchSelection { branches, list_state, selected_branch: None };
+                    }
+                    Err(e) => {
+                        app.state = AppState::Finished(format!("Failed to fetch branches:\n\n{}", e));
+                    }
+                }
+                app.branch_rx = None;
+            }
+        }
+
         if let Some(rx) = &app.progress_rx {
             if let Ok(progress) = rx.try_recv() {
                 match progress {
@@ -49,6 +99,30 @@ pub fn run<B: Backend + Write>(
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Release {
+                    if let AppState::ConfirmUpdate { .. } = &app.state {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.should_perform_update = true;
+                                return Ok(());
+                            }
+                            KeyCode::Esc => {
+                                app.state = AppState::Browsing;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    if let AppState::ViewingChangelog { scroll, .. } = &mut app.state {
+                        match key.code {
+                            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                            KeyCode::Down => *scroll = scroll.saturating_add(1),
+                            KeyCode::Esc => app.state = AppState::Browsing,
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     if app.tutorial.is_some() && !app.tutorial_paused {
                         handle_tutorial_input(app, key, music_player)?;
                     } else {
@@ -87,10 +161,24 @@ fn is_valid_instance_folder(path: &Path) -> bool {
 
 
 fn handle_tutorial_input(app: &mut App, key: event::KeyEvent, music_player: &mut MusicPlayer) -> Result<()> {
+    if key.code == KeyCode::Char('s') {
+        music_player.play_confirm_sfx();
+        history::mark_tutorial_as_completed().ok();
+        app.tutorial = None;
+        app.tutorial_interactive = true;
+        if let Some(version) = app.pending_update.clone() {
+            app.state = AppState::ConfirmUpdate { version };
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.tutorial = None;
             music_player.play_cancel_sfx();
+            if let Some(version) = app.pending_update.clone() {
+                app.state = AppState::ConfirmUpdate { version };
+            }
             return Ok(());
         }
         KeyCode::Char('p') => {
@@ -230,6 +318,14 @@ fn handle_startup_input(app: &mut App, key: event::KeyEvent, music_player: &mut 
                 }
             }
         }
+        KeyCode::Char('c') => {
+            let (tx, rx) = mpsc::channel();
+            app.changelog_rx = Some(rx);
+            app.state = AppState::FetchingChangelog;
+            std::thread::spawn(move || {
+                changelog::fetch_changelog_background(tx);
+            });
+        }
         KeyCode::Char('p') => music_player.toggle_pause(),
         _ => {}
     }
@@ -264,6 +360,10 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
         _ => {}
     }
 
+    // --- THE FIX: Use a temporary variable to hold the next state ---
+    let mut next_state: Option<AppState> = None;
+    let mut branch_to_process: Option<String> = None;
+
     match &mut app.state {
         AppState::Browsing => match key.code {
             KeyCode::Down => app.next(),
@@ -277,15 +377,18 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                     if Some(current_path) == app.selected_path.as_ref() {
                         if is_valid_instance_folder(current_path) {
                             app.confirmed_path = Some(current_path.clone());
-                            app.state = AppState::ConfirmReinit;
+                            next_state = Some(AppState::ConfirmReinit);
                             if app.tutorial.is_some() {
                                 history::mark_tutorial_as_completed().ok();
                                 app.tutorial = None;
+                                if let Some(version) = app.pending_update.clone() {
+                                    next_state = Some(AppState::ConfirmUpdate { version });
+                                }
                             }
                         } else {
-                            app.state = AppState::ConfirmInvalidFolder {
+                            next_state = Some(AppState::ConfirmInvalidFolder {
                                 path: current_path.clone(),
-                            };
+                            });
                         }
                     } else {
                         app.selected_path = Some(current_path.clone());
@@ -293,18 +396,14 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                 }
             }
             KeyCode::Esc => {
-                // --- THE FIX ---
                 if app.selected_path.is_some() {
                     app.selected_path = None;
                 } else {
-                    // Before returning to the startup screen, validate the history.
                     app.history.retain(|path| path.exists() && path.is_dir());
 
-                    // Also, reset the selection to a valid state.
                     if app.history.is_empty() {
                         app.history_state.select(None);
                     } else {
-                        // Select the last item, which is the "Specify new..." option.
                         app.history_state.select(Some(app.history.len()));
                     }
 
@@ -312,7 +411,7 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                 }
             }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.state = AppState::AwaitingInput;
+                next_state = Some(AppState::AwaitingInput);
                 app.input.reset();
                 app.input_error = None;
             }
@@ -322,14 +421,14 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
         },
         AppState::ConfirmInvalidFolder { .. } => {
             if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
-                app.state = AppState::Browsing;
+                next_state = Some(AppState::Browsing);
                 app.selected_path = None;
             }
         }
         AppState::InsideInstanceFolderError => {
             if key.code == KeyCode::Left {
                 app.go_up()?;
-                app.state = AppState::Browsing;
+                next_state = Some(AppState::Browsing);
             }
         }
         AppState::AwaitingInput => {
@@ -346,35 +445,34 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                         if path_str == "literally me" {
                             app.gosling_mode = true;
                             music_player.play_secret_track();
-                            app.state = AppState::Browsing;
+                            next_state = Some(AppState::Browsing);
                             app.input_error = None;
-                            return Ok(true);
-                        }
-                        let path = git::parse_input_path(path_str);
-                        if path.exists() && path.is_dir() {
-                            app.init_file_browser(path.clone())?;
-                            app.input_error = None;
-
-                            if is_valid_instance_folder(&path) {
-                                if app.tutorial_paused {
-                                    app.tutorial = Some(TutorialState::InsideInstanceFolderHint);
-                                    app.tutorial_interactive = false;
-                                    app.tutorial_paused = false;
-                                } else {
-                                    app.state = AppState::InsideInstanceFolderError;
-                                }
-                            } else if app.tutorial_paused {
-                                app.tutorial = Some(TutorialState::FileBrowserSelect);
-                                app.tutorial_interactive = true;
-                                app.tutorial_paused = false;
-                            }
-
                         } else {
-                            app.input_error = Some("Error: Path not found or is not a directory.".to_string());
+                            let path = git::parse_input_path(path_str);
+                            if path.exists() && path.is_dir() {
+                                app.init_file_browser(path.clone())?;
+                                app.input_error = None;
+
+                                if is_valid_instance_folder(&path) {
+                                    if app.tutorial_paused {
+                                        app.tutorial = Some(TutorialState::InsideInstanceFolderHint);
+                                        app.tutorial_interactive = false;
+                                        app.tutorial_paused = false;
+                                    } else {
+                                        next_state = Some(AppState::InsideInstanceFolderError);
+                                    }
+                                } else if app.tutorial_paused {
+                                    app.tutorial = Some(TutorialState::FileBrowserSelect);
+                                    app.tutorial_interactive = true;
+                                    app.tutorial_paused = false;
+                                }
+                            } else {
+                                app.input_error = Some("Error: Path not found or is not a directory.".to_string());
+                            }
                         }
                     }
                     KeyCode::Esc => {
-                        app.state = AppState::Browsing;
+                        next_state = Some(AppState::Browsing);
                         app.input_error = None;
                         if app.tutorial_paused {
                             app.tutorial_paused = false;
@@ -389,28 +487,75 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
         AppState::ConfirmReinit => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let (tx, rx) = mpsc::channel();
-                app.progress_rx = Some(rx);
-                app.state = AppState::Processing {
-                    message: "Initializing...".to_string(),
-                    progress: 0.0,
-                };
-                let path = app.confirmed_path.clone().unwrap();
+                app.branch_rx = Some(rx);
+                next_state = Some(AppState::FetchingBranches);
                 std::thread::spawn(move || {
-                    git::perform_git_operations_threaded(path, tx);
+                    git::fetch_remote_branches_threaded(tx);
                 });
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.state = AppState::Browsing;
+                next_state = Some(AppState::Browsing);
                 app.confirmed_path = None;
             }
             _ => {}
         },
+        AppState::BranchSelection { branches, list_state, selected_branch } => {
+            match key.code {
+                KeyCode::Down => {
+                    if !branches.is_empty() {
+                        let i = list_state.selected().map_or(0, |i| (i + 1) % branches.len());
+                        list_state.select(Some(i));
+                    }
+                }
+                KeyCode::Up => {
+                    if !branches.is_empty() {
+                        let i = list_state.selected().map_or(0, |i| (i + branches.len() - 1) % branches.len());
+                        list_state.select(Some(i));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(i) = list_state.selected() {
+                        let highlighted_branch = &branches[i];
+                        if Some(highlighted_branch) == selected_branch.as_ref() {
+                            // Defer the state change and git operation
+                            branch_to_process = Some(highlighted_branch.clone());
+                        } else {
+                            *selected_branch = Some(highlighted_branch.clone());
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    if selected_branch.is_some() {
+                        *selected_branch = None;
+                    } else {
+                        next_state = Some(AppState::Browsing);
+                    }
+                }
+                _ => {}
+            }
+        }
         AppState::Finished(_) => {
             if matches!(key.code, KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc) {
                 return Ok(false);
             }
         }
-        AppState::Processing { .. } => {}
+        _ => {}
     }
+
+    // --- Now, apply the state changes outside of the borrow ---
+    if let Some(state) = next_state {
+        app.state = state;
+    }
+
+    if let Some(branch) = branch_to_process {
+        let (tx, rx) = mpsc::channel();
+        app.progress_rx = Some(rx);
+        app.state = AppState::Processing { message: "Initializing...".to_string(), progress: 0.0, };
+        let path = app.confirmed_path.clone().unwrap();
+        std::thread::spawn(move || {
+            git::perform_git_operations_threaded(path, branch, tx);
+        });
+    }
+
     Ok(true)
 }

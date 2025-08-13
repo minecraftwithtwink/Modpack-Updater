@@ -1,12 +1,37 @@
 pub(crate) use crate::app::GitProgress;
 use anyhow::{bail, Context, Result};
-use git2::{build::CheckoutBuilder, AnnotatedCommit, Repository};
+// --- ADDED: Remote for fetching branch list ---
+use git2::{build::CheckoutBuilder, AnnotatedCommit, Remote, Repository};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 const GIT_REMOTE_URL: &str = "https://github.com/minecraftwithtwink/Twinkcraft-Modpack.git";
-const GIT_BRANCH_NAME: &str = "main";
+
+// --- ADDED: A new function to fetch the list of remote branches ---
+pub fn fetch_remote_branches_threaded(tx: Sender<Result<Vec<String>>>) {
+    let result = (|| -> Result<Vec<String>> {
+        let mut remote = Remote::create_detached(GIT_REMOTE_URL)?;
+        remote.connect(git2::Direction::Fetch)?;
+        let list = remote.list()?;
+
+        let mut branches: Vec<String> = list.iter()
+            .filter_map(|head| {
+                let name = head.name();
+                if name.starts_with("refs/heads/") {
+                    Some(name.trim_start_matches("refs/heads/").to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        branches.sort();
+        Ok(branches)
+    })();
+    tx.send(result).ok();
+}
+
 
 fn clean_managed_directories(repo: &Repository, progress_tx: &Sender<GitProgress>) -> Result<()> {
     const DIRS_TO_CLEAN: &[&str] = &[
@@ -28,7 +53,6 @@ fn clean_managed_directories(repo: &Repository, progress_tx: &Sender<GitProgress
     Ok(())
 }
 
-// --- REWRITTEN: This function now uses only the Rust standard library for maximum compatibility ---
 fn force_copy_default_configs(instance_path: &Path, progress_tx: &Sender<GitProgress>) -> Result<()> {
     progress_tx.send(GitProgress::Update("Applying default configurations...".to_string(), 1.0)).ok();
 
@@ -62,11 +86,9 @@ fn force_copy_default_configs(instance_path: &Path, progress_tx: &Sender<GitProg
             }
 
             if *is_directory {
-                // Remove the old directory first to ensure a clean copy
                 if dest_path.exists() {
                     fs::remove_dir_all(&dest_path)?;
                 }
-                // Now, perform a recursive copy
                 copy_dir_all(&source_path, &dest_path)?;
             } else {
                 fs::copy(&source_path, &dest_path)?;
@@ -77,7 +99,6 @@ fn force_copy_default_configs(instance_path: &Path, progress_tx: &Sender<GitProg
     Ok(())
 }
 
-// --- ADDED: A helper function for recursive directory copy using std::fs ---
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
     fs::create_dir_all(&dst)?;
     for entry in fs::read_dir(src)? {
@@ -105,7 +126,8 @@ pub fn parse_input_path(input: &str) -> PathBuf {
     { PathBuf::from(stripped.replace('\\', "/")) }
 }
 
-pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitProgress>) {
+// --- MODIFIED: Now accepts a branch_name parameter ---
+pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progress_tx: Sender<GitProgress>) {
     let result = (|| -> Result<String> {
         let mut callbacks = git2::RemoteCallbacks::new();
         let tx = progress_tx.clone();
@@ -134,23 +156,21 @@ pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitPro
         let mut remote = repo.find_remote("origin").context("Failed to find remote 'origin'")?;
 
         progress_tx.send(GitProgress::Update("Fetching from remote...".to_string(), 0.0)).ok();
-        let refspec = format!("+refs/heads/{}:refs/remotes/origin/{}", GIT_BRANCH_NAME, GIT_BRANCH_NAME);
-        remote.fetch(&[refspec], Some(&mut fo), None).context("Failed to fetch. Check network/proxy/branch name ('main').")?;
+        let refspec = format!("+refs/heads/{0}:refs/remotes/origin/{0}", branch_name);
+        remote.fetch(&[&refspec], Some(&mut fo), None).context(format!("Failed to fetch. Check network/proxy/branch name ('{}').", branch_name))?;
 
         progress_tx.send(GitProgress::Update("Analyzing changes...".to_string(), 1.0)).ok();
-        let remote_branch_ref_name = format!("refs/remotes/origin/{}", GIT_BRANCH_NAME);
+        let remote_branch_ref_name = format!("refs/remotes/origin/{}", branch_name);
         let fetch_commit = repo.find_reference(&remote_branch_ref_name)?.peel_to_commit().context("Failed to find the latest commit")?;
         let fetch_head: AnnotatedCommit = repo.find_annotated_commit(fetch_commit.id())?;
         let (analysis, _) = repo.merge_analysis(&[&fetch_head])?;
 
-        // --- MODIFIED: Restructured logic to always run the final steps ---
         if analysis.is_up_to_date() {
-            // It's up-to-date, but we still force the cleanup and config copy.
             progress_tx.send(GitProgress::Update("Repository up-to-date. Verifying files...".to_string(), 1.0)).ok();
             repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         } else if analysis.is_fast_forward() || repo.head().is_err() {
             progress_tx.send(GitProgress::Update("Applying fast-forward update...".to_string(), 1.0)).ok();
-            let local_branch_ref_name = format!("refs/heads/{}", GIT_BRANCH_NAME);
+            let local_branch_ref_name = format!("refs/heads/{}", branch_name);
             let mut local_branch_ref = match repo.find_reference(&local_branch_ref_name) {
                 Ok(r) => r,
                 Err(_) => repo.reference(&local_branch_ref_name, fetch_commit.id(), true, "Create local branch")?,
@@ -170,11 +190,10 @@ pub fn perform_git_operations_threaded(path: PathBuf, progress_tx: Sender<GitPro
             let result_tree_id = index.write_tree_to(&repo)?;
             let result_tree = repo.find_tree(result_tree_id)?;
             let signature = git2::Signature::now("Modpack Updater", "updater@example.com")?;
-            repo.commit(Some("HEAD"), &signature, &signature, &format!("Merge remote-tracking branch 'origin/{}'", GIT_BRANCH_NAME), &result_tree, &[&our_commit, &fetch_commit])?;
+            repo.commit(Some("HEAD"), &signature, &signature, &format!("Merge remote-tracking branch 'origin/{}'", branch_name), &result_tree, &[&our_commit, &fetch_commit])?;
             repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
         }
 
-        // These crucial steps now run on EVERY successful path.
         clean_managed_directories(&repo, &progress_tx)?;
         force_copy_default_configs(&path, &progress_tx)?;
 

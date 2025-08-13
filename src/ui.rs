@@ -1,3 +1,4 @@
+use ratatui::widgets::ListState;
 use crate::app::{App, AppState, RunMode, TutorialState};
 use crate::music::MusicPlayer;
 use ratatui::{
@@ -23,18 +24,139 @@ pub fn draw(f: &mut Frame, app: &mut App, music_player: &MusicPlayer) {
     if app.tutorial.is_some() && !app.tutorial_paused {
         draw_tutorial_popup(f, app);
     } else {
-        match &app.state {
+        match &mut app.state {
             AppState::AwaitingInput => draw_input_ui(f, app),
             AppState::ConfirmReinit => draw_confirm_ui(f),
+            AppState::ConfirmUpdate { version } => draw_confirm_update_popup(f, version),
+            AppState::FetchingChangelog => draw_fetching_popup(f, "Fetching Changelog..."),
+            AppState::ViewingChangelog { content, scroll } => draw_changelog_popup(f, content, *scroll),
+            // --- ADDED: Call the new branch selection drawers ---
+            AppState::FetchingBranches => draw_fetching_popup(f, "Fetching Branches..."),
+            AppState::BranchSelection { branches, list_state, selected_branch } => {
+                draw_branch_selection_popup(f, branches, list_state, selected_branch);
+            }
             AppState::Processing { message, progress } => draw_processing_ui(f, message, *progress),
             AppState::Finished(msg) => draw_finished_ui(f, msg),
             AppState::ConfirmInvalidFolder { path } => draw_invalid_folder_popup(f, &path.display().to_string()),
-            // --- ADDED: Draw the new universal error popup ---
             AppState::InsideInstanceFolderError => draw_inside_folder_error_popup(f),
             _ => {}
         }
     }
 }
+
+// --- ADDED: The new popup for selecting a branch ---
+fn draw_branch_selection_popup(
+    f: &mut Frame,
+    branches: &[String],
+    list_state: &mut ListState,
+    selected_branch: &Option<String>,
+) {
+    let popup_width = 60;
+    let popup_height = 15;
+    let area = centered_rect(popup_width, popup_height, f.size());
+
+    let items: Vec<ListItem> = branches
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let is_hovered = Some(i) == list_state.selected();
+            let is_selected = Some(name) == selected_branch.as_ref();
+
+            let style = if is_selected && is_hovered {
+                Style::default().bg(Color::Green).fg(Color::Black)
+            } else if is_selected {
+                Style::default().fg(Color::Green)
+            } else if is_hovered {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+
+            let mut line = name.clone();
+            if is_hovered && is_selected {
+                line.push_str(" (confirm?)");
+            }
+            ListItem::new(Span::styled(line, style))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Select a Branch "))
+        .highlight_symbol("> ");
+
+    f.render_widget(Clear, area);
+    f.render_stateful_widget(list, area, list_state);
+}
+
+
+fn draw_fetching_popup(f: &mut Frame, message: &str) {
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(message),
+        Line::from(""),
+    ]);
+    let block = Block::default().title(" Please Wait ").borders(Borders::ALL);
+    let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
+    let area = centered_rect(40, 5, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(text_widget, area);
+}
+
+fn draw_changelog_popup(f: &mut Frame, content: &str, scroll: u16) {
+    let text = Text::from(content);
+
+    let popup_width = (f.size().width as f32 * 0.8) as u16;
+    let popup_height = (f.size().height as f32 * 0.8) as u16;
+    let area = centered_rect(popup_width, popup_height, f.size());
+
+    let block = Block::default()
+        .title(" Changelog (↑/↓ to scroll, Esc to close) ")
+        .borders(Borders::ALL);
+
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .scroll((scroll, 0));
+
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
+}
+
+
+fn draw_confirm_update_popup(f: &mut Frame, version: &str) {
+    let green_style = Style::default().fg(Color::Green);
+    let key_style = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
+
+    let text = Text::from(vec![
+        Line::from(vec![
+            Span::raw("A new version ("),
+            Span::styled(version, green_style.add_modifier(Modifier::BOLD)),
+            Span::raw(") is available!"),
+        ]),
+        Line::from(""),
+        Line::from("Would you like to update now?"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Y ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" Yes "),
+            Span::styled(" Esc ", key_style),
+            Span::raw(" No (update on next launch) "),
+        ]),
+    ]);
+
+    let popup_width = (text.width() + 4).min(f.size().width.into());
+    let popup_height = (text.height() as u16 + 2).min(f.size().height);
+    let area = centered_rect(popup_width.try_into().unwrap(), popup_height, f.size());
+
+    let block = Block::default()
+        .title(" Update Available ")
+        .borders(Borders::ALL)
+        .border_style(green_style);
+    let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
+
+    f.render_widget(Clear, area);
+    f.render_widget(text_widget, area);
+}
+
 
 fn draw_tutorial_popup(f: &mut Frame, app: &mut App) {
     let tutorial_state = app.tutorial.unwrap();
@@ -131,7 +253,6 @@ fn draw_tutorial_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(text_widget, area);
 }
 
-// --- ADDED: A new popup for the universal "inside folder" error ---
 fn draw_inside_folder_error_popup(f: &mut Frame) {
     let red_style = Style::default().fg(Color::Red);
     let key_style = Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD);
@@ -189,7 +310,6 @@ fn draw_invalid_folder_popup(f: &mut Frame, path_str: &str) {
     f.render_widget(text_widget, area);
 }
 
-// ... rest of file is unchanged ...
 fn draw_music_bar(f: &mut Frame, area: Rect, music_player: &MusicPlayer, is_dimmed: bool) {
     let (title, artist, song_style) = music_player.get_current_song_info();
     let dimmed_style = Style::default().fg(Color::DarkGray);
@@ -240,12 +360,14 @@ fn draw_startup_ui(f: &mut Frame, app: &mut App, music_player: &MusicPlayer, is_
     let music_text = if music_player.is_paused { "Play Music  " } else { "Pause Music  " };
     let music_status_tooltip = format!(" {:<width$} ", music_text, width = MUSIC_TOOLTIP_WIDTH);
 
+    // --- MODIFIED: Added 'C' for Changelog to the footer ---
     let footer_lines = vec![
         Line::from(vec![Span::raw("      "), Span::styled(" ↑ ", if is_dimmed {header_style} else {Style::default().bg(Color::Blue).fg(Color::White)})]),
         Line::from(vec![
             Span::raw("   "),
             Span::styled(" ← ", Style::default().bg(Color::DarkGray).fg(Color::Black)), Span::styled(" ↓ ", if is_dimmed {header_style} else {Style::default().bg(Color::Blue).fg(Color::White)}), Span::styled(" → ", Style::default().bg(Color::DarkGray).fg(Color::Black)), Span::raw(" Scroll Up/Down   "),
             Span::styled(" Enter ", if is_dimmed {header_style} else {Style::default().bg(Color::Green).fg(Color::White)}), Span::raw(" Confirm   "),
+            Span::styled(" C ", if is_dimmed {header_style} else {Style::default().bg(Color::Yellow).fg(Color::Black)}), Span::raw(" Changelog   "),
             Span::styled(" P ", if is_dimmed {header_style} else {Style::default().bg(Color::Cyan).fg(Color::White)}), Span::raw(&music_status_tooltip),
             Span::styled(" Q/Esc ", if is_dimmed {header_style} else {Style::default().bg(Color::Red).fg(Color::White)}), Span::raw(" Quit   "),
         ]),

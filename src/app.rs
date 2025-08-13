@@ -15,6 +15,13 @@ pub enum GitProgress {
 }
 
 #[derive(Debug)]
+pub enum UpdateStatus {
+    UpToDate,
+    UpdateAvailable(String),
+    Error(String),
+}
+
+#[derive(Debug)]
 pub enum RunMode {
     StartupSelection,
     FileBrowser,
@@ -25,8 +32,17 @@ pub enum AppState {
     AwaitingInput,
     ConfirmReinit,
     ConfirmInvalidFolder { path: PathBuf },
-    // --- ADDED: A new universal error state for when the CWD is inside an instance ---
     InsideInstanceFolderError,
+    ConfirmUpdate { version: String },
+    FetchingChangelog,
+    ViewingChangelog { content: String, scroll: u16 },
+    // --- ADDED: New states for branch selection ---
+    FetchingBranches,
+    BranchSelection {
+        branches: Vec<String>,
+        list_state: ListState,
+        selected_branch: Option<String>,
+    },
     Processing { message: String, progress: f64 },
     Finished(String),
 }
@@ -57,6 +73,12 @@ pub struct App {
     pub input: Input,
     pub input_error: Option<String>,
     pub progress_rx: Option<Receiver<GitProgress>>,
+    pub update_rx: Option<Receiver<UpdateStatus>>,
+    pub changelog_rx: Option<Receiver<Result<String>>>,
+    // --- ADDED: A channel to receive the list of branches ---
+    pub branch_rx: Option<Receiver<Result<Vec<String>>>>,
+    pub pending_update: Option<String>,
+    pub should_perform_update: bool,
     pub gosling_mode: bool,
     pub tutorial: Option<TutorialState>,
     pub tutorial_interactive: bool,
@@ -92,6 +114,11 @@ impl App {
             input: Input::default(),
             input_error: None,
             progress_rx: None,
+            update_rx: None,
+            changelog_rx: None,
+            branch_rx: None, // Initialize as None
+            pending_update: None,
+            should_perform_update: false,
             gosling_mode: false,
             tutorial,
             tutorial_interactive,
