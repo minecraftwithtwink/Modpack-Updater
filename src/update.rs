@@ -27,7 +27,7 @@ pub fn check_for_updates_background(tx: Sender<UpdateStatus>) {
 
     match result {
         Ok(status) => tx.send(status).ok(),
-        Err(_err) => tx.send(UpdateStatus::Error(std::string::String::from("Failed to check for updates"))).ok(),
+        Err(_err) => tx.send(UpdateStatus::Error).ok(),
     };
 }
 
