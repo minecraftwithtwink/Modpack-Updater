@@ -5,6 +5,8 @@ mod git;
 mod music;
 mod ui;
 mod update;
+// --- ADDED: The new module for dependency checking ---
+mod dependency_check;
 
 use crate::app::App;
 use anyhow::Result;
@@ -12,9 +14,9 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::env; // --- ADDED: To get the current executable's path ---
+use std::env;
 use std::io;
-use std::process::Command; // --- ADDED: To spawn the new process ---
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
@@ -51,13 +53,10 @@ fn main() -> Result<()> {
 
     if app.should_perform_update {
         println!("Starting update...");
-        // --- MODIFIED: The update and relaunch logic is now here ---
         match update::perform_update() {
             Ok(_) => {
                 println!("Update successful! Relaunching...");
-                // Try to get the path to the new executable
                 if let Ok(updated_exe_path) = env::current_exe() {
-                    // Spawn the new process. `.spawn()` detaches it, allowing our old process to exit cleanly.
                     Command::new(updated_exe_path).spawn()?;
                 }
             }
@@ -67,7 +66,6 @@ fn main() -> Result<()> {
                 let _ = io::stdin().read_line(&mut String::new());
             }
         }
-        // Exit immediately after attempting the update, whether it succeeded or failed.
         return Ok(());
     }
 
