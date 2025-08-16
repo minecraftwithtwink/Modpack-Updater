@@ -1,5 +1,6 @@
-use crate::app::{history, App, AppState, RunMode, TutorialState, UpdateStatus};
+use crate::app::{history, App, AppState, DependencyStatus, RunMode, TutorialState, UpdateStatus};
 use crate::changelog;
+use crate::dependency_check;
 use crate::git;
 use crate::music::MusicPlayer;
 use crate::ui;
@@ -13,6 +14,7 @@ use std::env;
 use std::io::Write;
 use std::path::Path;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -22,7 +24,43 @@ pub fn run<B: Backend + Write>(
     app: &mut App,
     music_player: &mut MusicPlayer,
 ) -> Result<()> {
+    // Start the initial dependency check
+    let (tx, rx) = mpsc::channel();
+    app.dependency_rx = Some(rx);
+    thread::spawn(move || {
+        dependency_check::check_dependencies_background(tx);
+    });
+
     loop {
+        // --- Channel Checkers ---
+        if let Some(rx) = &app.dependency_rx {
+            if let Ok(status) = rx.try_recv() {
+                match status {
+                    DependencyStatus::AllOk => {
+                        app.state = AppState::Browsing;
+                    }
+                    _ => {
+                        app.state = AppState::ConfirmDependencyInstall { missing: status };
+                    }
+                }
+                app.dependency_rx = None;
+            }
+        }
+
+        if let Some(rx) = &app.install_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(_) => {
+                        app.state = AppState::Browsing;
+                    }
+                    Err(e) => {
+                        app.state = AppState::Finished(format!("Dependency installation failed:\n\n{}\n\nPlease install Git and Git LFS manually.", e));
+                    }
+                }
+                app.install_rx = None;
+            }
+        }
+
         if let Some(rx) = &app.update_rx {
             if let Ok(status) = rx.try_recv() {
                 match status {
@@ -99,30 +137,51 @@ pub fn run<B: Backend + Write>(
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Release {
-                    if let AppState::ConfirmUpdate { .. } = &app.state {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                app.should_perform_update = true;
-                                return Ok(());
+                    // --- Top-level input handlers for popups ---
+                    match &mut app.state {
+                        AppState::ConfirmDependencyInstall { .. } => {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let (tx, rx) = mpsc::channel();
+                                    app.install_rx = Some(rx);
+                                    app.state = AppState::InstallingDependencies;
+                                    thread::spawn(move || {
+                                        dependency_check::install_dependencies_background(tx);
+                                    });
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                                    return Ok(());
+                                }
+                                _ => {}
                             }
-                            KeyCode::Esc => {
-                                app.state = AppState::Browsing;
-                            }
-                            _ => {}
+                            continue;
                         }
-                        continue;
+                        AppState::ConfirmUpdate { .. } => {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    app.should_perform_update = true;
+                                    return Ok(());
+                                }
+                                KeyCode::Esc => {
+                                    app.state = AppState::Browsing;
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        AppState::ViewingChangelog { scroll, .. } => {
+                            match key.code {
+                                KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                                KeyCode::Esc => app.state = AppState::Browsing,
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
 
-                    if let AppState::ViewingChangelog { scroll, .. } = &mut app.state {
-                        match key.code {
-                            KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                            KeyCode::Down => *scroll = scroll.saturating_add(1),
-                            KeyCode::Esc => app.state = AppState::Browsing,
-                            _ => {}
-                        }
-                        continue;
-                    }
-
+                    // --- Main input routing ---
                     if app.tutorial.is_some() && !app.tutorial_paused {
                         handle_tutorial_input(app, key, music_player)?;
                     } else {
@@ -158,7 +217,6 @@ fn is_valid_instance_folder(path: &Path) -> bool {
     let has_config = path.join("config").is_dir();
     has_mods && has_config
 }
-
 
 fn handle_tutorial_input(app: &mut App, key: event::KeyEvent, music_player: &mut MusicPlayer) -> Result<()> {
     if key.code == KeyCode::Char('s') {
@@ -283,7 +341,6 @@ fn handle_tutorial_input(app: &mut App, key: event::KeyEvent, music_player: &mut
     Ok(())
 }
 
-
 fn handle_startup_input(app: &mut App, key: event::KeyEvent, music_player: &mut MusicPlayer) -> Result<()> {
     if app.gosling_mode {
         if key.code != KeyCode::Char('p') {
@@ -360,7 +417,6 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
         _ => {}
     }
 
-    // --- THE FIX: Use a temporary variable to hold the next state ---
     let mut next_state: Option<AppState> = None;
     let mut branch_to_process: Option<String> = None;
 
@@ -400,13 +456,11 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                     app.selected_path = None;
                 } else {
                     app.history.retain(|path| path.exists() && path.is_dir());
-
                     if app.history.is_empty() {
                         app.history_state.select(None);
                     } else {
                         app.history_state.select(Some(app.history.len()));
                     }
-
                     app.mode = RunMode::StartupSelection;
                 }
             }
@@ -452,7 +506,6 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                             if path.exists() && path.is_dir() {
                                 app.init_file_browser(path.clone())?;
                                 app.input_error = None;
-
                                 if is_valid_instance_folder(&path) {
                                     if app.tutorial_paused {
                                         app.tutorial = Some(TutorialState::InsideInstanceFolderHint);
@@ -517,7 +570,6 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
                     if let Some(i) = list_state.selected() {
                         let highlighted_branch = &branches[i];
                         if Some(highlighted_branch) == selected_branch.as_ref() {
-                            // Defer the state change and git operation
                             branch_to_process = Some(highlighted_branch.clone());
                         } else {
                             *selected_branch = Some(highlighted_branch.clone());
@@ -542,7 +594,6 @@ fn handle_file_browser_input(app: &mut App, key: event::KeyEvent, music_player: 
         _ => {}
     }
 
-    // --- Now, apply the state changes outside of the borrow ---
     if let Some(state) = next_state {
         app.state = state;
     }

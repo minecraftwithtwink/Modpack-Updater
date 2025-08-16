@@ -18,7 +18,15 @@ pub enum GitProgress {
 pub enum UpdateStatus {
     UpToDate,
     UpdateAvailable(String),
-    Error(String),
+    Error,
+}
+
+// --- ADDED: Enum for dependency check results ---
+#[derive(Debug)]
+pub enum DependencyStatus {
+    AllOk,
+    GitMissing,
+    GitLfsMissing,
 }
 
 #[derive(Debug)]
@@ -28,6 +36,10 @@ pub enum RunMode {
 }
 
 pub enum AppState {
+    // --- ADDED: New states for the initial dependency check ---
+    CheckingDependencies,
+    ConfirmDependencyInstall { missing: DependencyStatus },
+    InstallingDependencies,
     Browsing,
     AwaitingInput,
     ConfirmReinit,
@@ -36,7 +48,6 @@ pub enum AppState {
     ConfirmUpdate { version: String },
     FetchingChangelog,
     ViewingChangelog { content: String, scroll: u16 },
-    // --- ADDED: New states for branch selection ---
     FetchingBranches,
     BranchSelection {
         branches: Vec<String>,
@@ -75,8 +86,11 @@ pub struct App {
     pub progress_rx: Option<Receiver<GitProgress>>,
     pub update_rx: Option<Receiver<UpdateStatus>>,
     pub changelog_rx: Option<Receiver<Result<String>>>,
-    // --- ADDED: A channel to receive the list of branches ---
     pub branch_rx: Option<Receiver<Result<Vec<String>>>>,
+    // --- ADDED: Channel for dependency check results ---
+    pub dependency_rx: Option<Receiver<DependencyStatus>>,
+    // --- ADDED: Channel for dependency installation results ---
+    pub install_rx: Option<Receiver<Result<()>>>,
     pub pending_update: Option<String>,
     pub should_perform_update: bool,
     pub gosling_mode: bool,
@@ -110,13 +124,16 @@ impl App {
             list_state: ListState::default(),
             selected_path: None,
             confirmed_path: None,
-            state: AppState::Browsing,
+            // --- MODIFIED: App now starts in the CheckingDependencies state ---
+            state: AppState::CheckingDependencies,
             input: Input::default(),
             input_error: None,
             progress_rx: None,
             update_rx: None,
             changelog_rx: None,
-            branch_rx: None, // Initialize as None
+            branch_rx: None,
+            dependency_rx: None,
+            install_rx: None,
             pending_update: None,
             should_perform_update: false,
             gosling_mode: false,
