@@ -18,8 +18,10 @@ pub enum GitProgress {
 pub enum UpdateStatus {
     UpToDate,
     UpdateAvailable(String),
-    Error(String),
+    Error,
 }
+
+
 
 #[derive(Debug)]
 pub enum RunMode {
@@ -36,7 +38,6 @@ pub enum AppState {
     ConfirmUpdate { version: String },
     FetchingChangelog,
     ViewingChangelog { content: String, scroll: u16 },
-    // --- ADDED: New states for branch selection ---
     FetchingBranches,
     BranchSelection {
         branches: Vec<String>,
@@ -75,7 +76,6 @@ pub struct App {
     pub progress_rx: Option<Receiver<GitProgress>>,
     pub update_rx: Option<Receiver<UpdateStatus>>,
     pub changelog_rx: Option<Receiver<Result<String>>>,
-    // --- ADDED: A channel to receive the list of branches ---
     pub branch_rx: Option<Receiver<Result<Vec<String>>>>,
     pub pending_update: Option<String>,
     pub should_perform_update: bool,
@@ -116,7 +116,7 @@ impl App {
             progress_rx: None,
             update_rx: None,
             changelog_rx: None,
-            branch_rx: None, // Initialize as None
+            branch_rx: None,
             pending_update: None,
             should_perform_update: false,
             gosling_mode: false,

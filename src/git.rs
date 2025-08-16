@@ -1,12 +1,54 @@
 pub(crate) use crate::app::GitProgress;
 use anyhow::{bail, Context, Result};
-// --- ADDED: Remote for fetching branch list ---
 use git2::{build::CheckoutBuilder, AnnotatedCommit, Remote, Repository};
+use octocrab::Octocrab;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use tokio::runtime::Runtime;
 
 const GIT_REMOTE_URL: &str = "https://github.com/minecraftwithtwink/Twinkcraft-Modpack.git";
+
+// LFS-related structures
+#[derive(Serialize)]
+struct LfsBatchRequest {
+    operation: String,
+    transfer: Vec<String>,
+    objects: Vec<LfsObject>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LfsObject {
+    oid: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct LfsBatchResponse {
+    objects: Vec<LfsObjectResponse>,
+}
+
+#[derive(Deserialize)]
+struct LfsObjectResponse {
+    #[allow(dead_code)]
+    oid: String,
+    #[allow(dead_code)]
+    size: u64,
+    actions: Option<LfsActions>,
+}
+
+#[derive(Deserialize)]
+struct LfsActions {
+    download: Option<LfsAction>,
+}
+
+#[derive(Deserialize)]
+struct LfsAction {
+    href: String,
+    #[allow(dead_code)]
+    expires_at: Option<String>,
+}
 
 // --- ADDED: A new function to fetch the list of remote branches ---
 pub fn fetch_remote_branches_threaded(tx: Sender<Result<Vec<String>>>) {
@@ -32,6 +74,156 @@ pub fn fetch_remote_branches_threaded(tx: Sender<Result<Vec<String>>>) {
     tx.send(result).ok();
 }
 
+// Function to check if a file is an LFS pointer file
+fn is_lfs_pointer_file(content: &str) -> Option<(String, u64)> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() >= 3
+        && lines[0] == "version https://git-lfs.github.com/spec/v1"
+        && lines[1].starts_with("oid sha256:")
+        && lines[2].starts_with("size ") {
+
+        let oid = lines[1].strip_prefix("oid sha256:").unwrap_or("").to_string();
+        let size_str = lines[2].strip_prefix("size ").unwrap_or("0");
+        if let Ok(size) = size_str.parse::<u64>() {
+            return Some((oid, size));
+        }
+    }
+    None
+}
+
+// Function to download LFS files using GitHub API
+async fn download_lfs_files_async(repo_path: &Path, branch_name: &str, progress_tx: &Sender<GitProgress>) -> Result<()> {
+    progress_tx.send(GitProgress::Update("Scanning for LFS files...".to_string(), 0.0)).ok();
+
+    let octocrab = Octocrab::builder().build()?;
+    let owner = "minecraftwithtwink";
+    let repo_name = "Twinkcraft-Modpack";
+
+    // Get repository contents recursively to find LFS files
+    let mut lfs_files = Vec::new();
+    scan_for_lfs_files_recursive(&octocrab, owner, repo_name, branch_name, "", repo_path, &mut lfs_files).await?;
+
+    if lfs_files.is_empty() {
+        progress_tx.send(GitProgress::Update("No LFS files found.".to_string(), 1.0)).ok();
+        return Ok(());
+    }
+
+    progress_tx.send(GitProgress::Update(format!("Found {} LFS files, downloading...", lfs_files.len()), 0.1)).ok();
+
+    // Download LFS files in batches
+    for (i, (file_path, oid, size)) in lfs_files.iter().enumerate() {
+        let progress = 0.1 + (i as f64 / lfs_files.len() as f64) * 0.9;
+        progress_tx.send(GitProgress::Update(format!("Downloading LFS file: {}", file_path), progress)).ok();
+
+        download_single_lfs_file(owner, repo_name, oid, *size, &repo_path.join(file_path)).await?;
+    }
+
+    progress_tx.send(GitProgress::Update("LFS files downloaded successfully.".to_string(), 1.0)).ok();
+    Ok(())
+}
+
+// Recursive function to scan for LFS files in repository
+fn scan_for_lfs_files_recursive<'a>(
+    octocrab: &'a Octocrab,
+    owner: &'a str,
+    repo: &'a str,
+    branch: &'a str,
+    path: &'a str,
+    local_repo_path: &'a Path,
+    lfs_files: &'a mut Vec<(String, String, u64)>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+    let contents = octocrab
+        .repos(owner, repo)
+        .get_content()
+        .path(path)
+        .r#ref(branch)
+        .send()
+        .await?;
+
+    for item in contents.items {
+        let item_path = if path.is_empty() { item.name.clone() } else { format!("{}/{}", path, item.name) };
+
+        match item.r#type.as_str() {
+            "file" => {
+                // Check if this file exists locally and is an LFS pointer
+                let local_file_path = local_repo_path.join(&item_path);
+                if local_file_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&local_file_path) {
+                        if let Some((oid, size)) = is_lfs_pointer_file(&content) {
+                            lfs_files.push((item_path, oid, size));
+                        }
+                    }
+                }
+            }
+            "dir" => {
+                // Recursively scan subdirectories
+                scan_for_lfs_files_recursive(octocrab, owner, repo, branch, &item_path, local_repo_path, lfs_files).await?;
+            }
+            _ => {} // Ignore other types
+        }
+    }
+
+    Ok(())
+    })
+}
+
+// Function to download a single LFS file
+async fn download_single_lfs_file(owner: &str, repo: &str, oid: &str, size: u64, local_path: &Path) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    // Create the batch request
+    let batch_request = LfsBatchRequest {
+        operation: "download".to_string(),
+        transfer: vec!["basic".to_string()],
+        objects: vec![LfsObject {
+            oid: oid.to_string(),
+            size,
+        }],
+    };
+
+    // Make request to LFS batch API
+    let lfs_url = format!("https://github.com/{}/{}.git/info/lfs/objects/batch", owner, repo);
+    let response = client
+        .post(&lfs_url)
+        .header("Accept", "application/vnd.git-lfs+json")
+        .header("Content-Type", "application/json")
+        .json(&batch_request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        bail!("LFS batch request failed: {}", response.status());
+    }
+
+    let batch_response: LfsBatchResponse = response.json().await?;
+
+    if let Some(object) = batch_response.objects.first() {
+        if let Some(actions) = &object.actions {
+            if let Some(download_action) = &actions.download {
+                // Download the actual file
+                let file_response = client.get(&download_action.href).send().await?;
+
+                if !file_response.status().is_success() {
+                    bail!("Failed to download LFS file: {}", file_response.status());
+                }
+
+                let file_content = file_response.bytes().await?;
+
+                // Ensure parent directory exists
+                if let Some(parent) = local_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                // Write the file
+                std::fs::write(local_path, file_content)?;
+                return Ok(());
+            }
+        }
+    }
+
+    bail!("No download URL found for LFS file with OID: {}", oid);
+}
 
 fn clean_managed_directories(repo: &Repository, progress_tx: &Sender<GitProgress>) -> Result<()> {
     const DIRS_TO_CLEAN: &[&str] = &[
@@ -167,7 +359,7 @@ pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progr
 
         if analysis.is_up_to_date() {
             progress_tx.send(GitProgress::Update("Repository up-to-date. Verifying files...".to_string(), 1.0)).ok();
-            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
         } else if analysis.is_fast_forward() || repo.head().is_err() {
             progress_tx.send(GitProgress::Update("Applying fast-forward update...".to_string(), 1.0)).ok();
             let local_branch_ref_name = format!("refs/heads/{}", branch_name);
@@ -177,7 +369,7 @@ pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progr
             };
             local_branch_ref.set_target(fetch_commit.id(), "Fast-forward")?;
             repo.set_head(&local_branch_ref_name)?;
-            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
         } else {
             progress_tx.send(GitProgress::Update("Merging changes...".to_string(), 1.0)).ok();
             let our_commit = repo.head()?.peel_to_commit()?;
@@ -191,11 +383,15 @@ pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progr
             let result_tree = repo.find_tree(result_tree_id)?;
             let signature = git2::Signature::now("Modpack Updater", "updater@example.com")?;
             repo.commit(Some("HEAD"), &signature, &signature, &format!("Merge remote-tracking branch 'origin/{}'", branch_name), &result_tree, &[&our_commit, &fetch_commit])?;
-            repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
+            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
         }
 
         clean_managed_directories(&repo, &progress_tx)?;
         force_copy_default_configs(&path, &progress_tx)?;
+
+        // Download LFS files
+        let rt = Runtime::new()?;
+        rt.block_on(download_lfs_files_async(&path, &branch_name, &progress_tx))?;
 
         Ok(format!("Successfully updated and verified repository at:\n\n{}\n\nPress Enter to close.", path.display()))
     })();
