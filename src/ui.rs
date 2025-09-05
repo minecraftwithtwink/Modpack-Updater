@@ -1,6 +1,6 @@
-use crate::app::{App, AppState, RunMode, TutorialState};
+use crate::app::{App, AppState, InstanceUpdateStatus, RunMode, TutorialState};
 use crate::music::MusicPlayer;
-use lazy_static::lazy_static; // Added for static styles
+use lazy_static::lazy_static;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -8,9 +8,12 @@ use ratatui::{
     widgets::{block::Title, Block, Borders, Clear, Gauge, List, ListItem, Paragraph},
     Frame,
 };
+use std::env;
 
 const MINECRAFT_VERSION: &str = "1.21.1";
-const NEOFORGE_VERSION: &str = "21.1.192";
+const NEOFORGE_VERSION: &str = "21.1.206";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const AUTHORS: &str = env!("CARGO_PKG_AUTHORS");
 
 // --- ADDED: A central module for all reusable styles ---
 mod styles {
@@ -35,6 +38,12 @@ mod styles {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App, music_player: &MusicPlayer) {
+    if let Some(version_check_rx) = &app.version_check_rx {
+        while let Ok((path, status)) = version_check_rx.try_recv() {
+            app.instance_versions.insert(path, status);
+        }
+    }
+
     let is_dimmed = !matches!(app.state, AppState::Browsing)
         || (app.tutorial.is_some() && !app.tutorial_interactive && !app.tutorial_paused);
 
@@ -47,7 +56,6 @@ pub fn draw(f: &mut Frame, app: &mut App, music_player: &MusicPlayer) {
         draw_tutorial_popup(f, app);
     } else {
         match &mut app.state {
-
             AppState::AwaitingInput => draw_input_ui(f, app),
             AppState::ConfirmReinit => draw_confirm_ui(f),
             AppState::ConfirmUpdate { version } => draw_confirm_update_popup(f, version),
@@ -66,31 +74,38 @@ pub fn draw(f: &mut Frame, app: &mut App, music_player: &MusicPlayer) {
     }
 }
 
-
-
-fn draw_branch_selection_popup(f: &mut Frame, branches: &[String], list_state: &mut ratatui::widgets::ListState, selected_branch: &Option<String>) {
+fn draw_branch_selection_popup(
+    f: &mut Frame,
+    branches: &[String],
+    list_state: &mut ratatui::widgets::ListState,
+    selected_branch: &Option<String>,
+) {
     let popup_width = 60;
     let popup_height = 15;
     let area = centered_rect(popup_width, popup_height, f.size());
 
-    let items: Vec<ListItem> = branches.iter().enumerate().map(|(i, name)| {
-        let is_hovered = Some(i) == list_state.selected();
-        let is_selected = Some(name) == selected_branch.as_ref();
-        let style = if is_selected && is_hovered {
-            Style::default().bg(Color::Green).fg(Color::Black)
-        } else if is_selected {
-            *styles::GREEN_STYLE
-        } else if is_hovered {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
-        let mut line = name.clone();
-        if is_hovered && is_selected {
-            line.push_str(" (confirm?)");
-        }
-        ListItem::new(Span::styled(line, style))
-    }).collect();
+    let items: Vec<ListItem> = branches
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let is_hovered = Some(i) == list_state.selected();
+            let is_selected = Some(name) == selected_branch.as_ref();
+            let style = if is_selected && is_hovered {
+                Style::default().bg(Color::Green).fg(Color::Black)
+            } else if is_selected {
+                *styles::GREEN_STYLE
+            } else if is_hovered {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut line = name.clone();
+            if is_hovered && is_selected {
+                line.push_str(" (confirm?)");
+            }
+            ListItem::new(Span::styled(line, style))
+        })
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Select a Branch "))
@@ -114,7 +129,9 @@ fn draw_changelog_popup(f: &mut Frame, content: &str, scroll: u16) {
     let popup_width = (f.size().width as f32 * 0.8) as u16;
     let popup_height = (f.size().height as f32 * 0.8) as u16;
     let area = centered_rect(popup_width, popup_height, f.size());
-    let block = Block::default().title(" Changelog (↑/↓ to scroll, Esc to close) ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Changelog (↑/↓ to scroll, Esc to close) ")
+        .borders(Borders::ALL);
     let paragraph = Paragraph::new(text).block(block).scroll((scroll, 0));
     f.render_widget(Clear, area);
     f.render_widget(paragraph, area);
@@ -122,16 +139,28 @@ fn draw_changelog_popup(f: &mut Frame, content: &str, scroll: u16) {
 
 fn draw_confirm_update_popup(f: &mut Frame, version: &str) {
     let text = Text::from(vec![
-        Line::from(vec![Span::raw("A new version ("), Span::styled(version, styles::GREEN_STYLE.add_modifier(Modifier::BOLD)), Span::raw(") is available!")]),
+        Line::from(vec![
+            Span::raw("A new version ("),
+            Span::styled(version, styles::GREEN_STYLE.add_modifier(Modifier::BOLD)),
+            Span::raw(") is available!"),
+        ]),
         Line::from(""),
         Line::from("Would you like to update now?"),
         Line::from(""),
-        Line::from(vec![Span::styled(" Y ", *styles::KEY_STYLE_GREEN), Span::raw(" Yes "), Span::styled(" Esc ", *styles::KEY_STYLE), Span::raw(" No (update on next launch) ")]),
+        Line::from(vec![
+            Span::styled(" Y ", *styles::KEY_STYLE_GREEN),
+            Span::raw(" Yes "),
+            Span::styled(" Esc ", *styles::KEY_STYLE),
+            Span::raw(" No (update on next launch) "),
+        ]),
     ]);
     let popup_width = (text.width() + 4).min(f.size().width.into());
     let popup_height = (text.height() as u16 + 2).min(f.size().height);
     let area = centered_rect(popup_width.try_into().unwrap(), popup_height, f.size());
-    let block = Block::default().title(" Update Available ").borders(Borders::ALL).border_style(*styles::GREEN_STYLE);
+    let block = Block::default()
+        .title(" Update Available ")
+        .borders(Borders::ALL)
+        .border_style(*styles::GREEN_STYLE);
     let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(Clear, area);
     f.render_widget(text_widget, area);
@@ -143,12 +172,19 @@ fn draw_tutorial_popup(f: &mut Frame, app: &mut App) {
         TutorialState::Welcome => (
             " Welcome to the Modpack Updater! ",
             Text::from(vec![
-                Line::from(vec![Span::raw("This tool is programmed by "), Span::styled(" @Metalhead Twink★ ", *styles::MAGENTA_STYLE), Span::raw(" to help you keep")]),
+                Line::from(vec![
+                    Span::raw("This tool is programmed by "),
+                    Span::styled(" @Metalhead Twink★ ", *styles::MAGENTA_STYLE),
+                    Span::raw(" to help you keep"),
+                ]),
                 Line::from("your Minecraft modpack instance up-to-date with the official Git repository."),
                 Line::from(""),
                 Line::from("Let's walk through the steps together."),
                 Line::from(""),
-                Line::from(vec![Span::styled("Press any key to continue...", Style::default().add_modifier(Modifier::ITALIC))]),
+                Line::from(vec![Span::styled(
+                    "Press any key to continue...",
+                    Style::default().add_modifier(Modifier::ITALIC),
+                )]),
             ]),
         ),
         TutorialState::StartupMenu => {
@@ -156,75 +192,187 @@ fn draw_tutorial_popup(f: &mut Frame, app: &mut App) {
                 Line::from("This is the instance selection menu."),
                 Line::from("Since it's your first time, the list is empty."),
                 Line::from(""),
-                Line::from(vec![Span::raw("Press "), Span::styled(" ↓ ", *styles::KEY_STYLE), Span::raw(" to select '"), Span::styled("Specify a new Instance...", *styles::CYAN_STYLE), Span::raw("'."), ]),
-                Line::from(vec![Span::raw("Then press "), Span::styled(" Enter ", *styles::KEY_STYLE), Span::raw(" to continue."), ]),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(" ↓ ", *styles::KEY_STYLE),
+                    Span::raw(" to select '"),
+                    Span::styled("Specify a new Instance...", *styles::CYAN_STYLE),
+                    Span::raw("'."),
+                ]),
+                Line::from(vec![
+                    Span::raw("Then press "),
+                    Span::styled(" Enter ", *styles::KEY_STYLE),
+                    Span::raw(" to continue."),
+                ]),
                 Line::from(""),
-                Line::from(vec![Span::styled("Press 'H' for a hint", Style::default().add_modifier(Modifier::ITALIC))])
+                Line::from(vec![Span::styled(
+                    "Press 'H' for a hint",
+                    Style::default().add_modifier(Modifier::ITALIC),
+                )]),
             ];
             if app.tutorial_step1_expanded {
                 lines.extend(vec![
                     Line::from(""),
-                    Line::from(Span::styled("What is an Instance?", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from(Span::styled(
+                        "What is an Instance?",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
                     Line::from("An instance is a dedicated folder for a specific, modded"),
                     Line::from("version of Minecraft. Launchers like Modrinth, CurseForge,"),
                     Line::from("or SKLauncher create these for you."),
                     Line::from(""),
-                    Line::from(vec![Span::raw("Please create a custom instance for Minecraft "), Span::styled(MINECRAFT_VERSION, *styles::GOLD_STYLE)]),
-                    Line::from(vec![Span::raw("using NeoForge "), Span::styled(NEOFORGE_VERSION, *styles::GOLD_STYLE), Span::raw(" before proceeding.")]),
+                    Line::from(vec![
+                        Span::raw("Please create a custom instance for Minecraft "),
+                        Span::styled(MINECRAFT_VERSION, *styles::GOLD_STYLE),
+                    ]),
+                    Line::from(vec![
+                        Span::raw("using NeoForge "),
+                        Span::styled(NEOFORGE_VERSION, *styles::GOLD_STYLE),
+                        Span::raw(" before proceeding."),
+                    ]),
                 ]);
             }
             (" Step 1: Select an Instance ", Text::from(lines))
-        },
+        }
         TutorialState::FileBrowserNav => (
             " Step 2: Find Your Instance Folder ",
             Text::from(vec![
                 Line::from("Now, navigate to your Minecraft instance folder."),
-                Line::from(vec![Span::styled(" ↑ ", *styles::KEY_STYLE), Span::raw("       "), Span::styled(" ↑ ", *styles::KEY_STYLE_DARK_GRAY), Span::raw("                                     ")]),
-                Line::from(vec![Span::raw("Use "), Span::styled(" ← ", *styles::KEY_STYLE_DARK_GRAY), Span::styled(" ↓ ", *styles::KEY_STYLE), Span::styled(" → ", *styles::KEY_STYLE_DARK_GRAY), Span::raw(" "), Span::styled(" ← ", *styles::KEY_STYLE), Span::styled(" ↓ ", *styles::KEY_STYLE_DARK_GRAY), Span::styled(" → ", *styles::KEY_STYLE), Span::raw(" or use "), Span::styled(" Ctrl+F ", *styles::KEY_STYLE_YELLOW), Span::raw(" to enter a path directly.")]),
+                Line::from(vec![
+                    Span::styled(" ↑ ", *styles::KEY_STYLE),
+                    Span::raw("       "),
+                    Span::styled(" ↑ ", *styles::KEY_STYLE_DARK_GRAY),
+                    Span::raw("                                     "),
+                ]),
+                Line::from(vec![
+                    Span::raw("Use "),
+                    Span::styled(" ← ", *styles::KEY_STYLE_DARK_GRAY),
+                    Span::styled(" ↓ ", *styles::KEY_STYLE),
+                    Span::styled(" → ", *styles::KEY_STYLE_DARK_GRAY),
+                    Span::raw(" "),
+                    Span::styled(" ← ", *styles::KEY_STYLE),
+                    Span::styled(" ↓ ", *styles::KEY_STYLE_DARK_GRAY),
+                    Span::styled(" → ", *styles::KEY_STYLE),
+                    Span::raw(" or use "),
+                    Span::styled(" Ctrl+F ", *styles::KEY_STYLE_YELLOW),
+                    Span::raw(" to enter a path directly."),
+                ]),
                 Line::from(""),
-                Line::from(vec![Span::raw("When you are in the correct directory, press "), Span::styled(" Enter ", *styles::KEY_STYLE)]),
+                Line::from(vec![
+                    Span::raw("When you are in the correct directory, press "),
+                    Span::styled(" Enter ", *styles::KEY_STYLE),
+                ]),
                 Line::from("to proceed to the selection step."),
-            ])
+            ]),
         ),
         TutorialState::InsideInstanceFolderHint => (
             " Whoops! A Quick Tip ",
-            Text::from(vec![Line::from("It looks like you're currently *inside* the instance folder."), Line::from("You need to select the folder that *contains* `mods`, `config`, etc."), Line::from(""), Line::from(vec![Span::raw("Please press "), Span::styled(" ← ", *styles::KEY_STYLE), Span::raw(" to go up one level.")])])
+            Text::from(vec![
+                Line::from("It looks like you're currently *inside* the instance folder."),
+                Line::from("You need to select the folder that *contains* `mods`, `config`, etc."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Please press "),
+                    Span::styled(" ← ", *styles::KEY_STYLE),
+                    Span::raw(" to go up one level."),
+                ]),
+            ]),
         ),
         TutorialState::FileBrowserSelect => (
             " Step 3: Select the Folder ",
-            Text::from(vec![Line::from("The folder list is now active for selection."), Line::from(""), Line::from(vec![Span::raw("Press "), Span::styled(" Enter ", *styles::KEY_STYLE), Span::raw(" while hovering on a folder to select it.")]), Line::from(""), Line::from(vec![Span::styled("Hint: ", *styles::GREEN_STYLE), Span::raw("You can use "), Span::styled(" Escape ", *styles::KEY_STYLE), Span::raw(" to go back or undo selection.")]), Line::from(""), Line::from(vec![Span::raw("The selected folder will turn "), Span::styled("green", *styles::GREEN_STYLE), Span::raw(".")])])
+            Text::from(vec![
+                Line::from("The folder list is now active for selection."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(" Enter ", *styles::KEY_STYLE),
+                    Span::raw(" while hovering on a folder to select it."),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Hint: ", *styles::GREEN_STYLE),
+                    Span::raw("You can use "),
+                    Span::styled(" Escape ", *styles::KEY_STYLE),
+                    Span::raw(" to go back or undo selection."),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("The selected folder will turn "),
+                    Span::styled("green", *styles::GREEN_STYLE),
+                    Span::raw("."),
+                ]),
+            ]),
         ),
         TutorialState::InvalidSelectionHint => (
             " Invalid Folder ",
-            Text::from(vec![Line::from(Span::styled("That folder doesn't look like a valid instance.", *styles::RED_STYLE)), Line::from(""), Line::from("Please select the main instance folder that contains"), Line::from(Span::raw("the `mods` and `config` subfolders.")), Line::from(""), Line::from(vec![Span::raw("Press "), Span::styled(" Enter ", *styles::KEY_STYLE), Span::raw(" to try again.")])])
+            Text::from(vec![
+                Line::from(Span::styled(
+                    "That folder doesn't look like a valid instance.",
+                    *styles::RED_STYLE,
+                )),
+                Line::from(""),
+                Line::from("Please select the main instance folder that contains"),
+                Line::from(Span::raw("the `mods` and `config` subfolders.")),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(" Enter ", *styles::KEY_STYLE),
+                    Span::raw(" to try again."),
+                ]),
+            ]),
         ),
         TutorialState::FileBrowserConfirm => (
             " Step 4: Confirm Your Selection ",
-            Text::from(vec![Line::from("Great! The folder is now selected."), Line::from(""), Line::from(vec![Span::raw("Press "), Span::styled(" Enter ", *styles::KEY_STYLE), Span::raw(" one more time to confirm and start the update.")]), Line::from(""), Line::from("This is the final step of the tutorial!")])
+            Text::from(vec![
+                Line::from("Great! The folder is now selected."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("Press "),
+                    Span::styled(" Enter ", *styles::KEY_STYLE),
+                    Span::raw(" one more time to confirm and start the update."),
+                ]),
+                Line::from(""),
+                Line::from("This is the final step of the tutorial!"),
+            ]),
         ),
     };
 
     let popup_width = (text.width() as u16 + 4).min(f.size().width);
     let popup_height = (text.height() as u16 + 2).min(f.size().height);
-    let block = Block::default().title(Span::styled(title, *styles::GOLD_STYLE)).borders(Borders::ALL).border_style(*styles::GOLD_STYLE);
+    let block = Block::default()
+        .title(Span::styled(title, *styles::GOLD_STYLE))
+        .borders(Borders::ALL)
+        .border_style(*styles::GOLD_STYLE);
     let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
     let area = centered_rect(popup_width, popup_height, f.size());
-    if tutorial_state == TutorialState::Welcome { f.render_widget(Clear, f.size()); }
+    if tutorial_state == TutorialState::Welcome {
+        f.render_widget(Clear, f.size());
+    }
     f.render_widget(Clear, area);
     f.render_widget(text_widget, area);
 }
 
 fn draw_inside_folder_error_popup(f: &mut Frame) {
     let text = Text::from(vec![
-        Line::from(Span::styled("You are currently inside an instance folder.", *styles::RED_STYLE)),
+        Line::from(Span::styled(
+            "You are currently inside an instance folder.",
+            *styles::RED_STYLE,
+        )),
         Line::from("You need to select the folder that *contains* `mods`, `config`, etc."),
         Line::from(""),
-        Line::from(vec![Span::raw("Please press "), Span::styled(" ← ", *styles::KEY_STYLE), Span::raw(" to go up to the parent directory.")]),
+        Line::from(vec![
+            Span::raw("Please press "),
+            Span::styled(" ← ", *styles::KEY_STYLE),
+            Span::raw(" to go up to the parent directory."),
+        ]),
     ]);
     let popup_width = (text.width() + 4).min(f.size().width.into());
     let popup_height = (text.height() as u16 + 2).min(f.size().height);
     let area = centered_rect(popup_width.try_into().unwrap(), popup_height, f.size());
-    let block = Block::default().title(" Incorrect Directory ").borders(Borders::ALL).border_style(*styles::RED_STYLE);
+    let block = Block::default()
+        .title(" Incorrect Directory ")
+        .borders(Borders::ALL)
+        .border_style(*styles::RED_STYLE);
     let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(Clear, area);
     f.render_widget(text_widget, area);
@@ -232,18 +380,31 @@ fn draw_inside_folder_error_popup(f: &mut Frame) {
 
 fn draw_invalid_folder_popup(f: &mut Frame, path_str: &str) {
     let text = Text::from(vec![
-        Line::from(vec![Span::styled("The folder '", *styles::RED_STYLE), Span::styled(path_str, styles::RED_STYLE.add_modifier(Modifier::BOLD)), Span::styled("' does not look like a", *styles::RED_STYLE)]),
+        Line::from(vec![
+            Span::styled("The folder '", *styles::RED_STYLE),
+            Span::styled(path_str, styles::RED_STYLE.add_modifier(Modifier::BOLD)),
+            Span::styled("' does not look like a", *styles::RED_STYLE),
+        ]),
         Line::from(Span::styled("valid Minecraft instance.", *styles::RED_STYLE)),
         Line::from(""),
         Line::from("A valid instance folder should directly contain"),
         Line::from("subfolders like `mods` and `config`."),
         Line::from(""),
-        Line::from(vec![Span::raw("Press "), Span::styled(" Enter ", *styles::KEY_STYLE), Span::raw(" or "), Span::styled(" Esc ", *styles::KEY_STYLE), Span::raw(" to return and select a different folder.")]),
+        Line::from(vec![
+            Span::raw("Press "),
+            Span::styled(" Enter ", *styles::KEY_STYLE),
+            Span::raw(" or "),
+            Span::styled(" Esc ", *styles::KEY_STYLE),
+            Span::raw(" to return and select a different folder."),
+        ]),
     ]);
     let popup_width = (text.width() + 4).min(f.size().width.into());
     let popup_height = (text.height() as u16 + 2).min(f.size().height);
     let area = centered_rect(popup_width.try_into().unwrap(), popup_height, f.size());
-    let block = Block::default().title(" Invalid Folder Selected ").borders(Borders::ALL).border_style(*styles::RED_STYLE);
+    let block = Block::default()
+        .title(" Invalid Folder Selected ")
+        .borders(Borders::ALL)
+        .border_style(*styles::RED_STYLE);
     let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(Clear, area);
     f.render_widget(text_widget, area);
@@ -254,10 +415,24 @@ fn draw_music_bar(f: &mut Frame, area: Rect, music_player: &MusicPlayer, is_dimm
     let dimmed_style = Style::default().fg(Color::DarkGray);
     let final_song_style = if is_dimmed { dimmed_style } else { song_style };
     let final_artist_style = if is_dimmed { dimmed_style } else { Style::default() };
-    let final_label_style = if is_dimmed { dimmed_style } else { Style::default().add_modifier(Modifier::BOLD) };
-    let status_text = if music_player.is_paused { "(Paused)" } else { "(Playing)" };
+    let final_label_style = if is_dimmed {
+        dimmed_style
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let status_text = if music_player.is_paused {
+        "(Paused)"
+    } else {
+        "(Playing)"
+    };
     let padded_status_text = format!("{:^9}", status_text);
-    let status_style = if is_dimmed { dimmed_style } else if music_player.is_paused { *styles::GOLD_STYLE } else { Style::default().fg(Color::LightCyan) };
+    let status_style = if is_dimmed {
+        dimmed_style
+    } else if music_player.is_paused {
+        *styles::GOLD_STYLE
+    } else {
+        Style::default().fg(Color::LightCyan)
+    };
     let music_text = Line::from(vec![
         Span::styled("Current Track: ", final_label_style),
         Span::styled(title, final_song_style),
@@ -270,25 +445,136 @@ fn draw_music_bar(f: &mut Frame, area: Rect, music_player: &MusicPlayer, is_dimm
 
 fn draw_startup_ui(f: &mut Frame, app: &mut App, music_player: &MusicPlayer, is_dimmed: bool) {
     let size = f.size();
-    let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(2)]).split(size);
-    let header_style = if is_dimmed { Style::default().fg(Color::DarkGray) } else { Style::default() };
-    let mut items: Vec<ListItem> = app.history.iter().map(|p| ListItem::new(Span::styled(p.display().to_string(), header_style))).collect();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(2)])
+        .split(size);
+    let header_style = if is_dimmed {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    let mut items: Vec<ListItem> = app
+        .history
+        .iter()
+        .map(|p| {
+            let status = app.instance_versions.get(p).cloned().unwrap_or(InstanceUpdateStatus::Checking);
+            let mut spans = vec![Span::styled(p.display().to_string(), header_style)];
+
+            match status {
+                InstanceUpdateStatus::UpToDate => {
+                    spans.push(Span::styled(" (Up to date)", Style::default().fg(Color::DarkGray)));
+                }
+                InstanceUpdateStatus::UpdateAvailable(v) => {
+                    spans.push(Span::styled(format!(" (Update Available: {})", v), *styles::GREEN_STYLE));
+                }
+                InstanceUpdateStatus::Error(e) => {
+                    spans.push(Span::styled(format!(" (Error: {})", e), *styles::RED_STYLE));
+                }
+                InstanceUpdateStatus::Checking => {
+                    spans.push(Span::styled(" (Checking...)", *styles::GOLD_STYLE));
+                }
+            };
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
     let new_instance_style = if is_dimmed { header_style } else { *styles::CYAN_STYLE };
-    items.push(ListItem::new(Span::styled("Specify a new Instance...", new_instance_style)));
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Select an Instance to Update ").style(header_style)).highlight_style(if is_dimmed { header_style } else { Style::default().add_modifier(Modifier::REVERSED) }).highlight_symbol(if is_dimmed { " " } else { "> " });
+    items.push(ListItem::new(Span::styled(
+        "Specify a new Instance...",
+        new_instance_style,
+    )));
+
+    let credit_text = format!(" Modpack Updater v{} | by @{} ", VERSION, AUTHORS);
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Select an Instance to Update ")
+                .title(
+                    Title::from(Span::styled(credit_text, header_style))
+                        .alignment(Alignment::Right),
+                )
+                .style(header_style),
+        )
+        .highlight_style(if is_dimmed {
+            header_style
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol(if is_dimmed { " " } else { "> " });
     f.render_stateful_widget(list, layout[0], &mut app.history_state);
     draw_music_bar(f, layout[1], music_player, is_dimmed);
     const MUSIC_TOOLTIP_WIDTH: usize = 13;
-    let music_text = if music_player.is_paused { "Play Music  " } else { "Pause Music  " };
+    let music_text = if music_player.is_paused {
+        "Play Music  "
+    } else {
+        "Pause Music  "
+    };
     let music_status_tooltip = format!(" {:<width$} ", music_text, width = MUSIC_TOOLTIP_WIDTH);
     let footer_lines = vec![
-        Line::from(vec![Span::raw("      "), Span::styled(" ↑ ", if is_dimmed { header_style } else { *styles::KEY_STYLE_BLUE })]),
         Line::from(vec![
-            Span::raw("   "), Span::styled(" ← ", *styles::KEY_STYLE_DARK_GRAY), Span::styled(" ↓ ", if is_dimmed { header_style } else { *styles::KEY_STYLE_BLUE }), Span::styled(" → ", *styles::KEY_STYLE_DARK_GRAY), Span::raw(" Scroll Up/Down   "),
-            Span::styled(" Enter ", if is_dimmed { header_style } else { *styles::KEY_STYLE_GREEN }), Span::raw(" Confirm   "),
-            Span::styled(" C ", if is_dimmed { header_style } else { *styles::KEY_STYLE_YELLOW }), Span::raw(" Changelog   "),
-            Span::styled(" P ", if is_dimmed { header_style } else { *styles::KEY_STYLE_CYAN }), Span::raw(&music_status_tooltip),
-            Span::styled(" Q/Esc ", if is_dimmed { header_style } else { *styles::KEY_STYLE_RED }), Span::raw(" Quit   "),
+            Span::raw("      "),
+            Span::styled(
+                " ↑ ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(" ← ", *styles::KEY_STYLE_DARK_GRAY),
+            Span::styled(
+                " ↓ ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+            Span::styled(" → ", *styles::KEY_STYLE_DARK_GRAY),
+            Span::raw(" Scroll Up/Down   "),
+            Span::styled(
+                " Enter ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_GREEN
+                },
+            ),
+            Span::raw(" Confirm   "),
+            Span::styled(
+                " C ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_YELLOW
+                },
+            ),
+            Span::raw(" Changelog   "),
+            Span::styled(
+                " P ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_CYAN
+                },
+            ),
+            Span::raw(&music_status_tooltip),
+            Span::styled(
+                " Q/Esc ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_RED
+                },
+            ),
+            Span::raw(" Quit   "),
         ]),
     ];
     f.render_widget(Paragraph::new(footer_lines).style(header_style), layout[2]);
@@ -296,62 +582,270 @@ fn draw_startup_ui(f: &mut Frame, app: &mut App, music_player: &MusicPlayer, is_
 
 fn draw_browsing_ui(f: &mut Frame, app: &mut App, music_player: &MusicPlayer, is_dimmed: bool) {
     let size = f.size();
-    let layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(4), Constraint::Min(1), Constraint::Length(1), Constraint::Length(2)]).split(size);
-    let header_style = if is_dimmed { Style::default().fg(Color::DarkGray) } else { Style::default() };
-    let dimmed_bg_style = if is_dimmed { Style::default().fg(Color::Black).bg(Color::DarkGray) } else { Style::default() };
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
+        .split(size);
+    let header_style = if is_dimmed {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let dimmed_bg_style = if is_dimmed {
+        Style::default().fg(Color::Black).bg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
     let selected_style = if is_dimmed { header_style } else { *styles::GREEN_STYLE };
-    let mut header_lines = vec![Line::from(vec![Span::styled(" Current path: ", header_style.add_modifier(Modifier::BOLD)), Span::styled(app.current_dir.display().to_string(), header_style)])];
+    let mut header_lines = vec![Line::from(vec![
+        Span::styled(
+            " Current path: ",
+            header_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(app.current_dir.display().to_string(), header_style),
+    ])];
     if let Some(default) = &app.confirmed_path {
-        header_lines.push(Line::from(vec![Span::styled(" Confirmed: ", header_style.add_modifier(Modifier::BOLD)), Span::styled(default.display().to_string(), header_style)]));
+        header_lines.push(Line::from(vec![
+            Span::styled(
+                " Confirmed: ",
+                header_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(default.display().to_string(), header_style),
+        ]));
     } else if let Some(selected) = &app.selected_path {
-        header_lines.push(Line::from(vec![Span::styled(" Selected: ", selected_style.add_modifier(Modifier::BOLD)), Span::styled(selected.display().to_string(), selected_style)]));
+        header_lines.push(Line::from(vec![
+            Span::styled(
+                " Selected: ",
+                selected_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(selected.display().to_string(), selected_style),
+        ]));
     }
-    let version = env!("CARGO_PKG_VERSION");
-    let authors = env!("CARGO_PKG_AUTHORS");
-    let credit_text = format!(" Modpack Updater v{} | by @{} ", version, authors);
-    let info_block = Block::default().borders(Borders::ALL).style(header_style).title(Title::from(" Info ").alignment(Alignment::Left)).title(Title::from(Span::styled(credit_text, header_style)).alignment(Alignment::Right));
+    let credit_text = format!(" Modpack Updater v{} | by @{} ", VERSION, AUTHORS);
+    let info_block = Block::default()
+        .borders(Borders::ALL)
+        .style(header_style)
+        .title(Title::from(" Info ").alignment(Alignment::Left))
+        .title(Title::from(Span::styled(credit_text, header_style)).alignment(Alignment::Right));
     f.render_widget(Paragraph::new(header_lines).block(info_block), layout[0]);
     let list_width = size.width.saturating_sub(2);
-    let items: Vec<ListItem> = app.items.iter().enumerate().map(|(i, p)| {
-        let filename = p.file_name().unwrap().to_string_lossy();
-        let is_hovered = Some(i) == app.list_state.selected();
-        let is_selected = Some(p) == app.selected_path.as_ref();
-        let style = if is_dimmed { Style::default().fg(Color::DarkGray) } else if is_selected && is_hovered { Style::default().bg(Color::Green).fg(Color::Black) } else if is_selected { *styles::GREEN_STYLE } else if is_hovered { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-        let mut line = filename.to_string();
-        if is_hovered && is_selected && !is_dimmed { line.push_str(" (confirm?)"); }
-        if line.len() < list_width as usize { line.push_str(&" ".repeat(list_width as usize - line.len())); }
-        ListItem::new(Span::styled(line, style))
-    }).collect();
-    f.render_stateful_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(" Folders ").style(header_style)).highlight_symbol(if is_dimmed { "" } else { "> " }), layout[1], &mut app.list_state);
+    let items: Vec<ListItem> = app
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let filename = p.file_name().unwrap().to_string_lossy();
+            let is_hovered = Some(i) == app.list_state.selected();
+            let is_selected = Some(p) == app.selected_path.as_ref();
+            let style = if is_dimmed {
+                Style::default().fg(Color::DarkGray)
+            } else if is_selected && is_hovered {
+                Style::default().bg(Color::Green).fg(Color::Black)
+            } else if is_selected {
+                *styles::GREEN_STYLE
+            } else if is_hovered {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut line = filename.to_string();
+            if is_hovered && is_selected && !is_dimmed {
+                line.push_str(" (confirm?)");
+            }
+            if line.len() < list_width as usize {
+                line.push_str(&" ".repeat(list_width as usize - line.len()));
+            }
+            ListItem::new(Span::styled(line, style))
+        })
+        .collect();
+    f.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Folders ")
+                    .style(header_style),
+            )
+            .highlight_symbol(if is_dimmed { "" } else { "> " }),
+        layout[1],
+        &mut app.list_state,
+    );
     draw_music_bar(f, layout[2], music_player, is_dimmed);
     const SELECT_CONTENT_WIDTH: usize = 9;
     const ESC_CONTENT_WIDTH: usize = 10;
     const MUSIC_TOOLTIP_WIDTH: usize = 13;
-    let select_text = if app.selected_path.is_some() { "Confirm  " } else { "Select  " };
-    let esc_text = if app.selected_path.is_some() { "Deselect  " } else { "Back  " };
-    let music_status_tooltip = if music_player.is_paused { "Play Music  " } else { "Pause Music  " };
+    let select_text = if app.selected_path.is_some() {
+        "Confirm  "
+    } else {
+        "Select  "
+    };
+    let esc_text = if app.selected_path.is_some() {
+        "Deselect  "
+    } else {
+        "Back  "
+    };
+    let music_status_tooltip = if music_player.is_paused {
+        "Play Music  "
+    } else {
+        "Pause Music  "
+    };
     let select_status_text = format!(" {:<width$} ", select_text, width = SELECT_CONTENT_WIDTH);
     let esc_status_text = format!(" {:<width$} ", esc_text, width = ESC_CONTENT_WIDTH);
     let music_status_tooltip_padded = format!(" {:<width$} ", music_status_tooltip, width = MUSIC_TOOLTIP_WIDTH);
     let footer_lines = vec![
-        Line::from(vec![Span::raw("      "), Span::styled(" ↑ ", if is_dimmed { header_style } else { *styles::KEY_STYLE_DARK_GRAY }), Span::styled("                                ", header_style), Span::styled(" ↑ ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_BLUE })]),
         Line::from(vec![
-            Span::raw("   "), Span::styled(" ← ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_BLUE }), Span::styled(" ↓ ", if is_dimmed { header_style } else { *styles::KEY_STYLE_DARK_GRAY }), Span::styled(" → ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_BLUE }), Span::styled(" Navigate in/out folder   ", header_style),
-            Span::styled(" ← ", if is_dimmed { header_style } else { *styles::KEY_STYLE_DARK_GRAY }), Span::styled(" ↓ ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_BLUE }), Span::styled(" → ", if is_dimmed { header_style } else { *styles::KEY_STYLE_DARK_GRAY }), Span::styled(" Scroll Up/Down   ", header_style),
-            Span::styled(" Enter ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_GREEN }), Span::styled(&select_status_text, header_style),
-            Span::styled(" Esc ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_BLUE }), Span::styled(&esc_status_text, header_style),
-            Span::styled(" Home ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_CYAN }), Span::styled(" Reset   ", header_style),
-            Span::styled(" Ctrl+F ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_YELLOW }), Span::styled(" Change Path   ", header_style),
-            Span::styled(" P ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_CYAN }), Span::styled(&music_status_tooltip_padded, header_style),
-            Span::styled(" Q ", if is_dimmed { dimmed_bg_style } else { *styles::KEY_STYLE_RED }), Span::styled(" Quit", header_style),
+            Span::raw("      "),
+            Span::styled(
+                " ↑ ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_DARK_GRAY
+                },
+            ),
+            Span::styled("                                ", header_style),
+            Span::styled(
+                " ↑ ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                " ← ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+            Span::styled(
+                " ↓ ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_DARK_GRAY
+                },
+            ),
+            Span::styled(
+                " → ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+            Span::styled(" Navigate in/out folder   ", header_style),
+            Span::styled(
+                " ← ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_DARK_GRAY
+                },
+            ),
+            Span::styled(
+                " ↓ ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+            Span::styled(
+                " → ",
+                if is_dimmed {
+                    header_style
+                } else {
+                    *styles::KEY_STYLE_DARK_GRAY
+                },
+            ),
+            Span::styled(" Scroll Up/Down   ", header_style),
+            Span::styled(
+                " Enter ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_GREEN
+                },
+            ),
+            Span::styled(&select_status_text, header_style),
+            Span::styled(
+                " Esc ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_BLUE
+                },
+            ),
+            Span::styled(&esc_status_text, header_style),
+            Span::styled(
+                " Home ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_CYAN
+                },
+            ),
+            Span::styled(" Reset   ", header_style),
+            Span::styled(
+                " Ctrl+F ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_YELLOW
+                },
+            ),
+            Span::styled(" Change Path   ", header_style),
+            Span::styled(
+                " P ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_CYAN
+                },
+            ),
+            Span::styled(&music_status_tooltip_padded, header_style),
+            Span::styled(
+                " Q ",
+                if is_dimmed {
+                    dimmed_bg_style
+                } else {
+                    *styles::KEY_STYLE_RED
+                },
+            ),
+            Span::styled(" Quit", header_style),
         ]),
     ];
     f.render_widget(Paragraph::new(footer_lines), layout[3]);
 }
 
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - r.height.min(height) * 100 / r.height) / 2), Constraint::Length(height), Constraint::Percentage((100 - r.height.min(height) * 100 / r.height) / 2)]).split(r);
-    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - r.width.min(width) * 100 / r.width) / 2), Constraint::Length(width), Constraint::Percentage((100 - r.width.min(width) * 100 / r.width) / 2)]).split(popup_layout[1])[1]
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - r.height.min(height) * 100 / r.height) / 2),
+            Constraint::Length(height),
+            Constraint::Percentage((100 - r.height.min(height) * 100 / r.height) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - r.width.min(width) * 100 / r.width) / 2),
+            Constraint::Length(width),
+            Constraint::Percentage((100 - r.width.min(width) * 100 / r.width) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 fn draw_input_ui(f: &mut Frame, app: &App) {
@@ -359,9 +853,14 @@ fn draw_input_ui(f: &mut Frame, app: &App) {
     let popup_height = if app.input_error.is_some() { 5 } else { 3 };
     let area = centered_rect(f.size().width * popup_width / 100, popup_height, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default().title(" Change Directory (Enter to confirm, Esc to cancel) ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Change Directory (Enter to confirm, Esc to cancel) ")
+        .borders(Borders::ALL);
     if let Some(err) = &app.input_error {
-        let input_chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Length(1)]).split(area);
+        let input_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(1)])
+            .split(area);
         let input_widget = Paragraph::new(app.input.value()).block(block);
         f.render_widget(input_widget, input_chunks[0]);
         let error_text = Paragraph::new(Span::styled(err, *styles::RED_STYLE)).alignment(Alignment::Center);
@@ -380,10 +879,23 @@ fn draw_processing_ui(f: &mut Frame, message: &str, progress: f64) {
     f.render_widget(Clear, area);
     let block = Block::default().title(" Git Operation ").borders(Borders::ALL);
     f.render_widget(block, area);
-    let inner_chunks = Layout::default().direction(Direction::Vertical).margin(1).constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
     let text_widget = Paragraph::new(Text::from(message)).alignment(Alignment::Center);
     f.render_widget(text_widget, inner_chunks[0]);
-    let gauge = Gauge::default().ratio(progress).label(format!("{:.0}%", progress * 100.0)).style(Style::default().fg(Color::Cyan)).gauge_style(Style::default().fg(Color::White).bg(Color::Black).add_modifier(Modifier::BOLD));
+    let gauge = Gauge::default()
+        .ratio(progress)
+        .label(format!("{:.0}%", progress * 100.0))
+        .style(Style::default().fg(Color::Cyan))
+        .gauge_style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
     f.render_widget(gauge, inner_chunks[2]);
 }
 
@@ -395,13 +907,21 @@ fn draw_confirm_ui(f: &mut Frame) {
         Line::from("updating files tracked by the repository."),
         Line::from("Untracked files will not be affected."),
         Line::from(""),
-        Line::from(vec![Span::styled("Continue? ", Style::default()), Span::styled(" Y ", *styles::KEY_STYLE_GREEN), Span::raw(" Yes "), Span::styled(" N ", *styles::KEY_STYLE_RED), Span::raw(" No ")]),
+        Line::from(vec![
+            Span::styled("Continue? ", Style::default()),
+            Span::styled(" Y ", *styles::KEY_STYLE_GREEN),
+            Span::raw(" Yes "),
+            Span::styled(" N ", *styles::KEY_STYLE_RED),
+            Span::raw(" No "),
+        ]),
     ]);
     let popup_width = (text.width() + 4).min(f.size().width.into());
     let popup_height = (text.height() as u16 + 2).min(f.size().height);
     let area = centered_rect(popup_width.try_into().unwrap(), popup_height, f.size());
     f.render_widget(Clear, area);
-    let block = Block::default().title(" Confirmation Required ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Confirmation Required ")
+        .borders(Borders::ALL);
     let text_widget = Paragraph::new(text).block(block).alignment(Alignment::Center);
     f.render_widget(text_widget, area);
 }

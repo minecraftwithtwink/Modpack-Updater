@@ -1,27 +1,55 @@
-use anyhow::Result;
+use crate::update::UpdateStatus;
+use anyhow::{Context, Result};
 use ratatui::widgets::ListState;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
+use tokio::runtime::Runtime;
 use tui_input::Input;
 
 pub mod history;
 
-#[derive(Debug)]
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct ModpackInfo {
+    pub branch: String,
+    pub version: String,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct MinecraftInfo {
+    pub version: String,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct LoaderInfo {
+    #[serde(rename = "type")]
+    pub loader_type: String,
+    pub version: String,
+}
+
+#[derive(Deserialize, Debug, PartialEq)]
+pub struct VersionCheck {
+    pub modpack: ModpackInfo,
+    pub minecraft: MinecraftInfo,
+    pub loader: LoaderInfo,
+}
+
+#[derive(Debug, Clone)]
 pub enum GitProgress {
     Update(String, f64),
     Success(String),
     Failure(String),
 }
 
-#[derive(Debug)]
-pub enum UpdateStatus {
+#[derive(Debug, Clone)]
+pub enum InstanceUpdateStatus {
     UpToDate,
     UpdateAvailable(String),
-    Error,
+    Error(String),
+    Checking,
 }
-
-
 
 #[derive(Debug)]
 pub enum RunMode {
@@ -63,6 +91,8 @@ pub struct App {
     pub mode: RunMode,
     pub history: Vec<PathBuf>,
     pub history_state: ListState,
+    pub instance_versions: HashMap<PathBuf, InstanceUpdateStatus>,
+    pub version_check_rx: Option<Receiver<(PathBuf, InstanceUpdateStatus)>>,
     pub current_dir: PathBuf,
     pub initial_dir: PathBuf,
     pub items: Vec<PathBuf>,
@@ -83,7 +113,43 @@ pub struct App {
     pub tutorial: Option<TutorialState>,
     pub tutorial_interactive: bool,
     pub tutorial_paused: bool,
-    pub tutorial_step1_expanded: bool,
+    pub tutorial_step1_expanded: bool
+}
+
+async fn check_instance_version(path: &Path) -> InstanceUpdateStatus {
+    let result: Result<InstanceUpdateStatus> = (async {
+        let local_path = path.join("modpack_version_check.json");
+        if !local_path.exists() {
+            return Ok(InstanceUpdateStatus::Error("File not found".to_string()));
+        }
+
+        let local_content = fs::read_to_string(local_path).context("Failed to read local version file")?;
+        let local_version: VersionCheck = serde_json::from_str(&local_content).context("Failed to parse local version file")?;
+
+        let remote_url = format!(
+            "https://raw.githubusercontent.com/minecraftwithtwink/Twinkcraft-Modpack/{}/modpack_version_check.json",
+            local_version.modpack.branch
+        );
+
+        let client = reqwest::Client::new();
+        let response = client.get(&remote_url).send().await.context("Failed to fetch remote version file")?;
+
+        if !response.status().is_success() {
+            return Ok(InstanceUpdateStatus::Error(format!("Branch not found ({})", response.status())));
+        }
+
+        let remote_version: VersionCheck = response.json().await.context("Failed to parse remote version file")?;
+
+        if local_version.modpack.version != remote_version.modpack.version
+            || local_version.loader.version != remote_version.loader.version
+        {
+            Ok(InstanceUpdateStatus::UpdateAvailable(remote_version.modpack.version))
+        } else {
+            Ok(InstanceUpdateStatus::UpToDate)
+        }
+    }).await;
+
+    result.unwrap_or_else(|e: anyhow::Error| InstanceUpdateStatus::Error(format!("{}", e)))
 }
 
 impl App {
@@ -99,10 +165,26 @@ impl App {
             (None, false)
         };
 
+        let rt = Runtime::new()?;
+        let mut instance_versions = HashMap::new();
+        let (version_tx, version_rx) = std::sync::mpsc::channel();
+
+        for path in &history {
+            instance_versions.insert(path.clone(), InstanceUpdateStatus::Checking);
+            let path_clone = path.clone();
+            let version_tx_clone = version_tx.clone();
+            rt.spawn(async move {
+                let status = check_instance_version(&path_clone).await;
+                let _ = version_tx_clone.send((path_clone, status));
+            });
+        }
+
         Ok(Self {
             mode: RunMode::StartupSelection,
-            history,
+            history: history.clone(),
             history_state,
+            instance_versions,
+            version_check_rx: Some(version_rx),
             current_dir: PathBuf::new(),
             initial_dir: PathBuf::new(),
             items: vec![],
@@ -123,10 +205,10 @@ impl App {
             tutorial,
             tutorial_interactive,
             tutorial_paused: false,
-            tutorial_step1_expanded: false,
+            tutorial_step1_expanded: false
         })
     }
-    // ... rest of the file is unchanged ...
+
     pub fn init_file_browser(&mut self, path: PathBuf) -> Result<()> {
         let items = Self::read_dir(&path)?;
         let mut list_state = ListState::default();

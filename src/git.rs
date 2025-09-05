@@ -1,6 +1,6 @@
 pub(crate) use crate::app::GitProgress;
 use anyhow::{bail, Context, Result};
-use git2::{build::CheckoutBuilder, AnnotatedCommit, Remote, Repository};
+use git2::{build::CheckoutBuilder, Remote, Repository};
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -307,7 +307,7 @@ fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
 
 pub fn parse_input_path(input: &str) -> PathBuf {
     let trimmed = input.trim();
-    let stripped = if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+    let stripped = if trimmed.starts_with('\"') && trimmed.ends_with('\"') && trimmed.len() > 1 {
         &trimmed[1..trimmed.len() - 1]
     } else {
         trimmed
@@ -318,7 +318,7 @@ pub fn parse_input_path(input: &str) -> PathBuf {
     { PathBuf::from(stripped.replace('\\', "/")) }
 }
 
-// --- MODIFIED: Now accepts a branch_name parameter ---
+// --- MODIFIED: Now performs a hard reset instead of a merge ---
 pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progress_tx: Sender<GitProgress>) {
     let result = (|| -> Result<String> {
         let mut callbacks = git2::RemoteCallbacks::new();
@@ -347,44 +347,39 @@ pub fn perform_git_operations_threaded(path: PathBuf, branch_name: String, progr
         repo.remote_set_url("origin", GIT_REMOTE_URL).context("Failed to set remote URL")?;
         let mut remote = repo.find_remote("origin").context("Failed to find remote 'origin'")?;
 
-        progress_tx.send(GitProgress::Update("Fetching from remote...".to_string(), 0.0)).ok();
+        progress_tx.send(GitProgress::Update(format!("Fetching from remote branch: {}", branch_name), 0.0)).ok();
         let refspec = format!("+refs/heads/{0}:refs/remotes/origin/{0}", branch_name);
         remote.fetch(&[&refspec], Some(&mut fo), None).context(format!("Failed to fetch. Check network/proxy/branch name ('{}').", branch_name))?;
 
-        progress_tx.send(GitProgress::Update("Analyzing changes...".to_string(), 1.0)).ok();
-        let remote_branch_ref_name = format!("refs/remotes/origin/{}", branch_name);
-        let fetch_commit = repo.find_reference(&remote_branch_ref_name)?.peel_to_commit().context("Failed to find the latest commit")?;
-        let fetch_head: AnnotatedCommit = repo.find_annotated_commit(fetch_commit.id())?;
-        let (analysis, _) = repo.merge_analysis(&[&fetch_head])?;
+        progress_tx.send(GitProgress::Update("Applying changes...".to_string(), 1.0)).ok();
 
-        if analysis.is_up_to_date() {
-            progress_tx.send(GitProgress::Update("Repository up-to-date. Verifying files...".to_string(), 1.0)).ok();
-            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
-        } else if analysis.is_fast_forward() || repo.head().is_err() {
-            progress_tx.send(GitProgress::Update("Applying fast-forward update...".to_string(), 1.0)).ok();
-            let local_branch_ref_name = format!("refs/heads/{}", branch_name);
-            let mut local_branch_ref = match repo.find_reference(&local_branch_ref_name) {
-                Ok(r) => r,
-                Err(_) => repo.reference(&local_branch_ref_name, fetch_commit.id(), true, "Create local branch")?,
-            };
-            local_branch_ref.set_target(fetch_commit.id(), "Fast-forward")?;
-            repo.set_head(&local_branch_ref_name)?;
-            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
-        } else {
-            progress_tx.send(GitProgress::Update("Merging changes...".to_string(), 1.0)).ok();
-            let our_commit = repo.head()?.peel_to_commit()?;
-            let merge_base_oid = repo.merge_base(our_commit.id(), fetch_commit.id())?;
-            let merge_base_commit = repo.find_commit(merge_base_oid)?;
-            let mut index = repo.merge_trees(&merge_base_commit.tree()?, &our_commit.tree()?, &fetch_commit.tree()?, None)?;
-            if index.has_conflicts() {
-                bail!("Merge conflict detected! Please resolve manually.");
+        let remote_branch_ref_name = format!("refs/remotes/origin/{}", branch_name);
+        let fetch_commit = repo.find_reference(&remote_branch_ref_name)?.peel_to_commit()
+            .context("Failed to find the latest commit on the remote branch")?;
+
+        // Hard reset to the fetched commit
+        repo.reset(
+            fetch_commit.as_object(),
+            git2::ResetType::Hard,
+            Some(CheckoutBuilder::new().force()),
+        ).context("Failed to reset the repository to the latest version.")?;
+
+        // Point the local branch to the new commit
+        let local_branch_ref_name = format!("refs/heads/{}", branch_name);
+        match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(local_branch) => {
+                let mut ref_ = local_branch.into_reference();
+                ref_.set_target(fetch_commit.id(), "Hard reset local branch to remote")?;
             }
-            let result_tree_id = index.write_tree_to(&repo)?;
-            let result_tree = repo.find_tree(result_tree_id)?;
-            let signature = git2::Signature::now("Modpack Updater", "updater@example.com")?;
-            repo.commit(Some("HEAD"), &signature, &signature, &format!("Merge remote-tracking branch 'origin/{}'", branch_name), &result_tree, &[&our_commit, &fetch_commit])?;
-            repo.checkout_head(Some(CheckoutBuilder::default().force()))?;
-        }
+            Err(_) => {
+                repo.branch(&branch_name, &fetch_commit, true)?;
+            }
+        };
+
+        // Set HEAD to the local branch and checkout
+        repo.set_head(&local_branch_ref_name)?;
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))
+            .context("Failed to check out the updated files.")?;
 
         clean_managed_directories(&repo, &progress_tx)?;
         force_copy_default_configs(&path, &progress_tx)?;

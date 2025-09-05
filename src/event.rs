@@ -1,8 +1,9 @@
-use crate::app::{history, App, AppState, RunMode, TutorialState, UpdateStatus};
+use crate::app::{history, App, AppState, RunMode, TutorialState};
 use crate::changelog;
 use crate::git;
 use crate::music::MusicPlayer;
 use crate::ui;
+use crate::update::UpdateStatus;
 use anyhow::Result;
 use arboard::Clipboard;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -15,7 +16,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 use tui_input::backend::crossterm::EventHandler;
-
 
 pub fn run<B: Backend + Write>(
     terminal: &mut Terminal<B>,
